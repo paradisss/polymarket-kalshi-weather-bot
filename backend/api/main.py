@@ -14,7 +14,7 @@ from backend.models.database import (
     Signal, Trade, BotState, AILog, ScanLog
 )
 from backend.core.signals import scan_for_signals, TradingSignal
-from backend.data.btc_markets import fetch_active_btc_markets, BtcMarket
+from backend.data.btc_markets import fetch_active_btc_markets, BtcMarket, timeframe_from_slug
 from backend.data.crypto import fetch_crypto_price, compute_btc_microstructure
 
 from pydantic import BaseModel
@@ -80,6 +80,7 @@ class BtcWindowResponse(BaseModel):
     is_upcoming: bool
     time_until_end: float
     spread: float
+    timeframe: str = "5m"
 
 
 class MicrostructureResponse(BaseModel):
@@ -110,6 +111,7 @@ class SignalResponse(BaseModel):
     event_slug: Optional[str] = None
     btc_price: float = 0.0
     btc_change_24h: float = 0.0
+    timeframe: Optional[str] = None
     window_end: Optional[datetime] = None
     actionable: bool = False
 
@@ -126,6 +128,7 @@ class TradeResponse(BaseModel):
     settled: bool
     result: str
     pnl: Optional[float]
+    timeframe: Optional[str] = None
 
 
 class BotStats(BaseModel):
@@ -336,7 +339,7 @@ async def get_btc_price():
 
 @app.get("/api/btc/windows", response_model=List[BtcWindowResponse])
 async def get_btc_windows():
-    """Get upcoming BTC 5-min windows with prices."""
+    """Get upcoming BTC Up/Down windows (all enabled timeframes) with prices."""
     try:
         markets = await fetch_active_btc_markets()
         return [
@@ -352,6 +355,7 @@ async def get_btc_windows():
                 is_upcoming=m.is_upcoming,
                 time_until_end=m.time_until_end,
                 spread=m.spread,
+                timeframe=m.timeframe,
             )
             for m in markets
         ]
@@ -383,7 +387,8 @@ async def get_actionable_signals():
 def _signal_to_response(s: TradingSignal, actionable: bool = False) -> SignalResponse:
     return SignalResponse(
         market_ticker=s.market.market_id,
-        market_title=f"BTC 5m - {s.market.slug}",
+        market_title=f"BTC {s.market.timeframe} - {s.market.slug}",
+        timeframe=s.market.timeframe,
         platform="polymarket",
         direction=s.direction,
         model_probability=s.model_probability,
@@ -419,6 +424,7 @@ async def get_trades(
             market_ticker=t.market_ticker,
             platform=t.platform,
             event_slug=t.event_slug,
+            timeframe=timeframe_from_slug(t.event_slug or ""),
             direction=t.direction,
             entry_price=t.entry_price,
             size=t.size,
@@ -911,6 +917,7 @@ async def get_dashboard(db: Session = Depends(get_db)):
                 is_upcoming=m.is_upcoming,
                 time_until_end=m.time_until_end,
                 spread=m.spread,
+                timeframe=m.timeframe,
             )
             for m in markets
         ]
@@ -933,6 +940,7 @@ async def get_dashboard(db: Session = Depends(get_db)):
             market_ticker=t.market_ticker,
             platform=t.platform,
             event_slug=t.event_slug,
+            timeframe=timeframe_from_slug(t.event_slug or ""),
             direction=t.direction,
             entry_price=t.entry_price,
             size=t.size,

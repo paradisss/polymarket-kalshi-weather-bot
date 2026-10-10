@@ -1,4 +1,4 @@
-"""Background scheduler for BTC 5-min autonomous trading."""
+"""Background scheduler for BTC Up/Down (5m/15m/1h/1d) autonomous trading."""
 import asyncio
 from datetime import datetime, timedelta
 from typing import List, Optional
@@ -54,10 +54,10 @@ def get_recent_events(limit: int = 50) -> List[dict]:
 
 async def scan_and_trade_job():
     """
-    Background job: Scan BTC 5-min markets, generate signals, execute trades.
+    Background job: Scan BTC Up/Down markets (all enabled timeframes), generate signals, execute trades.
     Runs every minute.
     """
-    log_event("info", "Scanning BTC 5-min markets...")
+    log_event("info", f"Scanning BTC markets ({settings.BTC_TIMEFRAMES})...")
 
     try:
         signals = await scan_for_signals()
@@ -67,6 +67,10 @@ async def scan_and_trade_job():
             "total_signals": len(signals),
             "actionable": len(actionable),
         })
+
+        if not settings.BTC_PAPER_TRADING:
+            log_event("info", f"Predict-only mode: {len(signals)} BTC windows scored (paper trading off)")
+            return
 
         if not actionable:
             log_event("info", "No actionable BTC signals")
@@ -83,7 +87,7 @@ async def scan_and_trade_job():
                 log_event("info", "Bot is paused, skipping trades")
                 return
 
-            MAX_TRADES_PER_SCAN = 2
+            MAX_TRADES_PER_SCAN = settings.MAX_TRADES_PER_SCAN
             MIN_TRADE_SIZE = 10
             MAX_TRADE_FRACTION = 0.03  # 3% max per trade
             MAX_TOTAL_PENDING = settings.MAX_TOTAL_PENDING_TRADES
@@ -104,8 +108,19 @@ async def scan_and_trade_job():
                 log_event("info", f"Max pending trades reached ({total_pending}/{MAX_TOTAL_PENDING})")
                 return
 
+            # Spread trades across timeframes: best signal of each timeframe first,
+            # then the rest by edge, at most 2 per timeframe per scan.
+            by_tf = {}
+            for sig in actionable:
+                by_tf.setdefault(getattr(sig.market, "timeframe", "5m"), []).append(sig)
+            ordered = [lst[0] for lst in by_tf.values()]
+            ordered.sort(key=lambda x: abs(x.edge), reverse=True)
+            rest = [x for lst in by_tf.values() for x in lst[1:2]]
+            rest.sort(key=lambda x: abs(x.edge), reverse=True)
+            ordered += rest
+
             trades_executed = 0
-            for signal in actionable[:MAX_TRADES_PER_SCAN]:
+            for signal in ordered:
                 # Check if we already have a trade for this market window
                 existing = db.query(Trade).filter(
                     Trade.event_slug == signal.market.slug,
@@ -126,7 +141,8 @@ async def scan_and_trade_job():
                     break
 
                 # Map up/down to yes/no for storage
-                entry_price = signal.market.up_price if signal.direction == "up" else signal.market.down_price
+                entry_price = getattr(signal, "entry_price", None) or (
+                    signal.market.up_price if signal.direction == "up" else signal.market.down_price)
 
                 trade = Trade(
                     market_ticker=signal.market.market_id,
@@ -156,9 +172,10 @@ async def scan_and_trade_job():
                 trades_executed += 1
 
                 log_event("trade",
-                    f"BTC {signal.direction.upper()} ${trade_size:.0f} @ {entry_price:.0%} | {signal.market.slug}",
+                    f"BTC {signal.market.timeframe} {signal.direction.upper()} ${trade_size:.0f} @ {entry_price:.0%} | {signal.market.slug}",
                     {
                         "slug": signal.market.slug,
+                        "timeframe": signal.market.timeframe,
                         "direction": signal.direction,
                         "size": trade_size,
                         "edge": signal.edge,
@@ -320,10 +337,16 @@ async def settlement_job():
     log_event("info", "Checking BTC trade settlements...")
 
     try:
-        from backend.core.settlement import settle_pending_trades, update_bot_state_with_settlements
+        from backend.core.settlement import (
+            settle_pending_trades, update_bot_state_with_settlements, settle_pending_predictions,
+        )
 
         db = SessionLocal()
         try:
+            scored = await settle_pending_predictions(db)
+            if scored:
+                log_event("success", f"Scored {scored} BTC predictions against their settled markets")
+
             pending_count = db.query(Trade).filter(Trade.settled == False).count()
 
             if pending_count == 0:
@@ -440,7 +463,7 @@ def start_scheduler():
         )
 
     scheduler.start()
-    log_event("success", "BTC 5-min trading scheduler started", {
+    log_event("success", f"BTC trading scheduler started ({settings.BTC_TIMEFRAMES})", {
         "scan_interval": f"{scan_seconds}s",
         "settlement_interval": f"{settle_seconds}s",
         "min_edge": f"{settings.MIN_EDGE_THRESHOLD:.0%}",

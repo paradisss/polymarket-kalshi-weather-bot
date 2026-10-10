@@ -296,6 +296,40 @@ async def settle_pending_trades(db: Session) -> List[Trade]:
     return settled_trades
 
 
+async def settle_pending_predictions(db: Session, limit: int = 40) -> int:
+    """Score stored BTC predictions (predict-only mode) once their market has resolved."""
+    try:
+        pending = (db.query(Signal)
+                   .filter(Signal.outcome_correct.is_(None), Signal.market_type == "btc")
+                   .order_by(Signal.timestamp.asc()).limit(limit).all())
+    except Exception as e:
+        logger.error(f"Failed to query pending predictions: {e}")
+        return 0
+    done = 0
+    for sig in pending:
+        slug = next((x[5:] for x in (sig.sources or []) if isinstance(x, str) and x.startswith("slug:")), None)
+        try:
+            resolved, value = await fetch_polymarket_resolution(sig.market_ticker, slug)
+        except Exception as e:
+            logger.debug(f"Prediction resolution failed for {sig.market_ticker}: {e}")
+            continue
+        if not resolved or value is None:
+            continue
+        sig.actual_outcome = "up" if value == 1.0 else "down"
+        sig.outcome_correct = (sig.direction == sig.actual_outcome)
+        sig.settlement_value = value
+        sig.settled_at = datetime.utcnow()
+        done += 1
+    if done:
+        try:
+            db.commit()
+        except Exception as e:
+            logger.error(f"Failed to commit prediction settlements: {e}")
+            db.rollback()
+            return 0
+    return done
+
+
 async def update_bot_state_with_settlements(db: Session, settled_trades: List[Trade]) -> None:
     """Update bot state with P&L from settled trades."""
     if not settled_trades:

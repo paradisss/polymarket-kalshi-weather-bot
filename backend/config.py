@@ -42,6 +42,23 @@ class Settings(BaseSettings):
     MAX_TRADES_PER_WINDOW: int = 1
     MAX_TOTAL_PENDING_TRADES: int = 20
 
+    # Multi-timeframe BTC Up/Down trading (comma lists, "tf:value")
+    BTC_TIMEFRAMES: str = "5m,15m,1h,1d"
+    BTC_TF_MIN_EDGE: str = "5m:0.02,15m:0.04,1h:0.05,1d:0.05"
+    BTC_TF_MAX_ENTRY: str = "5m:0.80,15m:0.80,1h:0.80,1d:0.80"
+    BTC_TF_MIN_TIME: str = "5m:60,15m:120,1h:300,1d:1800"
+    BTC_TF_MAX_TIME: str = "5m:1800,15m:1800,1h:7200,1d:129600"
+    MAX_TRADES_PER_SCAN: int = 4
+    # Rules model ("rules-v4": end price vs start price on each settlement feed). 5m can fall back to the old indicator model with "micro".
+    BTC_5M_MODEL: str = "rules"
+    # Predict-only by default: record one prediction per window (Polymarket order-book probability,
+    # which beat the price model in a backtest) and score it after settlement; no paper trades.
+    # Set true to paper-trade model-vs-market edges again (the backtest says those lose on average).
+    BTC_PAPER_TRADING: bool = False
+    # Only trade once this fraction of the window has elapsed (most of the outcome is locked in)
+    BTC_TF_MIN_ELAPSED: str = "5m:0.6,15m:0.75,1h:0.75,1d:0.5"
+    BTC_MAX_SPREAD: float = 0.05        # skip windows whose Up book is wider than this
+
     # Risk management
     DAILY_LOSS_LIMIT: float = 300.0
     MAX_TRADE_SIZE: float = 75.0
@@ -72,3 +89,16 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+
+def tf_setting(name: str, timeframe: str, default: float) -> float:
+    """Read a per-timeframe value from a "5m:0.02,1h:0.05" style setting."""
+    raw = getattr(settings, name, "") or ""
+    for part in raw.split(","):
+        k, _, v = part.partition(":")
+        if k.strip() == timeframe:
+            try:
+                return float(v)
+            except ValueError:
+                break
+    return default
