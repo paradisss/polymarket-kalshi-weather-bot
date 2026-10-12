@@ -205,3 +205,28 @@ def live_status(db) -> dict:
             "opened_at": r.opened_at.isoformat() + "Z" if r.opened_at else None,
         } for r in rows],
     }
+
+
+_key_check = {"at": 0.0, "result": None}
+
+
+async def check_key() -> dict:
+    """Read-only check that Polymarket US accepts the API key (signed GET /v1/account/balances).
+    Returns only ok/error - never balances, positions or the key. Cached for 5 minutes."""
+    import time
+    if not (settings.POLYMARKET_US_KEY_ID and settings.POLYMARKET_US_SECRET_KEY):
+        return {"key_set": False, "key_ok": False, "error": "no Polymarket US API key set"}
+    if _key_check["result"] and time.time() - _key_check["at"] < 300:
+        return _key_check["result"]
+    try:
+        await _client().balances()
+        res = {"key_set": True, "key_ok": True, "error": None}
+    except Exception as e:
+        msg = str(e)
+        if "401" in msg or "403" in msg:
+            msg = "Polymarket US rejected the key (" + ("401" if "401" in msg else "403") + "): " + msg.split(":", 1)[-1].strip()[:120]
+        elif "Incorrect padding" in msg or "base64" in msg.lower() or "32 bytes" in msg:
+            msg = "the secret key is not in the expected format (base64 Ed25519 key from polymarket.us/developer)"
+        res = {"key_set": True, "key_ok": False, "error": msg[:200]}
+    _key_check.update(at=time.time(), result=res)
+    return res

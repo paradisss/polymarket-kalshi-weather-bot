@@ -658,6 +658,15 @@ async def get_us_markets():
     }
 
 
+@app.get("/api/us/account")
+async def get_us_account():
+    """Whether the Polymarket US API key is set and accepted (read-only; no balances shown)."""
+    from backend.core.us_live import check_key, live_blockers
+    res = await check_key()
+    res["live_blockers"] = live_blockers()
+    return res
+
+
 @app.get("/api/survival")
 async def get_survival(db: Session = Depends(get_db)):
     """Survival-mode scoreboard: paper strategies priced at the ask with taker fees."""
