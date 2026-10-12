@@ -50,6 +50,7 @@ class TradingSignal:
     # Predict-only mode: market order-book probability of Up and how much of the window is done
     prediction_up: Optional[float] = None
     elapsed_frac: float = 0.0
+    price_model_up: Optional[float] = None  # rules-v4 price-model P(Up), for survival strategies
 
     @property
     def passes_threshold(self) -> bool:
@@ -463,6 +464,7 @@ async def generate_horizon_signal(market: BtcMarket, micro) -> Optional[TradingS
             btc_change_24h=micro.momentum_15m * 96,
             prediction_up=market_up_prob,
             elapsed_frac=t_el / T,
+            price_model_up=model_up_prob if market.is_active else None,
         )
 
     return TradingSignal(
@@ -525,6 +527,15 @@ async def scan_for_signals() -> List[TradingSignal]:
 
     # Persist signals with non-zero edge to DB for calibration tracking
     _persist_signals(signals)
+
+    # Survival mode: paper-trade the candidate strategies (ask + taker fee, risk rules)
+    try:
+        from backend.core.survival import record_survival_trades
+        n = record_survival_trades(signals)
+        if n:
+            logger.info(f"Survival: opened {n} paper trades")
+    except Exception as e:
+        logger.warning(f"Survival recording failed: {e}")
 
     return signals
 

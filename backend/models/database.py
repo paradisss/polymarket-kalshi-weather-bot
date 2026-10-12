@@ -101,6 +101,37 @@ class Signal(Base):
     settled_at = Column(DateTime, nullable=True)        # when we recorded the outcome
 
 
+class SurvivalTrade(Base):
+    """Survival mode: paper trades of candidate strategies, priced at the ask with Polymarket's
+    crypto taker fee, so each strategy has to prove it survives costs before any real money."""
+    __tablename__ = "survival_trades"
+
+    id = Column(Integer, primary_key=True, index=True)
+    strategy = Column(String, index=True)
+    market_id = Column(String, index=True)
+    slug = Column(String, nullable=True)
+    timeframe = Column(String, index=True)
+    window_end = Column(DateTime, nullable=True)
+    opened_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+    direction = Column(String)          # "up" or "down"
+    entry_price = Column(Float)         # ask paid for the chosen side (0-1)
+    mid_at_entry = Column(Float)        # market mid probability of the chosen side
+    model_at_entry = Column(Float, nullable=True)  # price-model probability of the chosen side
+    elapsed_frac = Column(Float)
+    shares = Column(Float)
+    stake = Column(Float)               # cash spent incl. fee
+    fee = Column(Float)
+
+    settled = Column(Boolean, default=False, index=True)
+    settled_at = Column(DateTime, nullable=True)
+    outcome = Column(String, nullable=True)   # "up" or "down"
+    result = Column(String, default="pending")  # pending, win, loss
+    pnl = Column(Float, nullable=True)
+    exit_price = Column(Float, nullable=True)   # bid sold at (take-profit / stop) - None if held to settlement
+    exit_reason = Column(String, nullable=True)  # "take_profit", "stop_loss", "settled"
+
+
 class AILog(Base):
     """Log of all AI API calls."""
     __tablename__ = "ai_logs"

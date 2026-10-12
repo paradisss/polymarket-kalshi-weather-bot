@@ -633,6 +633,13 @@ async def get_calibration(db: Session = Depends(get_db)):
     return {"buckets": buckets, "summary": summary}
 
 
+@app.get("/api/survival")
+async def get_survival(db: Session = Depends(get_db)):
+    """Survival-mode scoreboard: paper strategies priced at the ask with taker fees."""
+    from backend.core.survival import scoreboard
+    return scoreboard(db)
+
+
 # Kalshi endpoints
 @app.get("/api/kalshi/status")
 async def get_kalshi_status():

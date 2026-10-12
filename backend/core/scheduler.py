@@ -347,6 +347,14 @@ async def settlement_job():
             if scored:
                 log_event("success", f"Scored {scored} BTC predictions against their settled markets")
 
+            try:
+                from backend.core.survival import settle_survival_trades
+                sv = await settle_survival_trades(db)
+                if sv:
+                    log_event("success", f"Survival: settled {sv} paper trades")
+            except Exception as e:
+                logger.warning(f"Survival settlement failed: {e}")
+
             pending_count = db.query(Trade).filter(Trade.settled == False).count()
 
             if pending_count == 0:
