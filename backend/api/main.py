@@ -633,6 +633,46 @@ async def get_calibration(db: Session = Depends(get_db)):
     return {"buckets": buckets, "summary": summary}
 
 
+_intl5_cache = {"at": 0.0, "data": None}
+
+
+@app.get("/api/intl/5m")
+async def get_intl_5m():
+    """International Polymarket BTC Up/Down 5-minute windows (watch only: not tradable from the US).
+    Price to beat = Polymarket's own window open (Chainlink BTC/USD), live price = Chainlink."""
+    import math, time
+    if _intl5_cache["data"] and time.time() - _intl5_cache["at"] < 4:
+        return _intl5_cache["data"]
+    from backend.data.crypto import fetch_polymarket_open, fetch_chainlink_btc, fetch_btc_minute_vol_from_hourly
+    markets = await fetch_active_btc_markets(["5m"])
+    spot = await fetch_chainlink_btc()
+    vol = max((await fetch_btc_minute_vol_from_hourly()) or 0.0, 0.005)
+    now = datetime.utcnow()
+    out = []
+    for m in [x for x in markets if x.window_end.replace(tzinfo=None) > now][:3]:
+        ws, we = m.window_start, m.window_end
+        beat = await fetch_polymarket_open("5m", ws, we) if m.is_active else None
+        bid, ask = m.up_bid, m.up_ask
+        clean = m.quote_source == "clob" and bid is not None and ask is not None and 0 <= ask - bid <= 0.05
+        mid = (bid + ask) / 2 if clean else None
+        model = None
+        if m.is_active and beat and spot:
+            t_left = max((we.replace(tzinfo=None) - now).total_seconds() / 60, 0.05)
+            sd = math.sqrt(vol ** 2 * t_left + 0.002 ** 2)
+            model = max(0.01, min(0.99, 0.5 * (1 + math.erf(math.log(spot / beat) * 100 / sd / math.sqrt(2)))))
+        out.append({
+            "slug": m.slug, "window_start": ws.replace(tzinfo=None).isoformat() + "Z",
+            "window_end": we.replace(tzinfo=None).isoformat() + "Z", "active": m.is_active,
+            "up_bid": bid, "up_ask": ask, "market_up": mid, "price_to_beat": beat,
+            "distance": (spot - beat) if (spot and beat) else None, "model_up": model,
+            "url": f"https://polymarket.com/event/{m.slug}",
+        })
+    data = {"venue": "polymarket_international", "tradable_from_us": False, "index": "Chainlink BTC/USD",
+            "btc": spot, "windows": out, "generated_at": now.isoformat() + "Z"}
+    _intl5_cache.update(at=time.time(), data=data)
+    return data
+
+
 @app.get("/api/us/markets")
 async def get_us_markets():
     """Polymarket US BTC Up/Down windows priced exactly like the app: BRTI index, price to beat,
