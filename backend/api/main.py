@@ -633,6 +633,31 @@ async def get_calibration(db: Session = Depends(get_db)):
     return {"buckets": buckets, "summary": summary}
 
 
+@app.get("/api/us/markets")
+async def get_us_markets():
+    """Polymarket US BTC Up/Down windows priced exactly like the app: BRTI index, price to beat,
+    live book, and the BRTI price model's P(Up)."""
+    from backend.core.survival import fetch_us_quotes
+    quotes = await fetch_us_quotes()
+    brti = next((q.brti for q in quotes if q.brti), None)
+    return {
+        "venue": "polymarket_us",
+        "index": "CF Benchmarks BRTI",
+        "btc": brti,
+        "windows": [{
+            "slug": q.slug, "timeframe": q.timeframe,
+            "window_end": q.window_end.isoformat() + "Z",
+            "active": q.is_active, "elapsed_frac": round(q.elapsed_frac, 3),
+            "price_to_beat": q.price_to_beat,
+            "distance": (q.brti - q.price_to_beat) if (q.brti and q.price_to_beat) else None,
+            "up_bid": q.up_bid, "up_ask": q.up_ask, "market_up": q.mid,
+            "model_up": q.model_up, "fee_coef": q.fee_coef,
+            "url": f"https://polymarket.us/event/{q.slug.removeprefix('cpc-')}",
+        } for q in sorted(quotes, key=lambda x: ["15m", "1h", "1d"].index(x.timeframe))],
+        "generated_at": datetime.utcnow().isoformat() + "Z",
+    }
+
+
 @app.get("/api/survival")
 async def get_survival(db: Session = Depends(get_db)):
     """Survival-mode scoreboard: paper strategies priced at the ask with taker fees."""

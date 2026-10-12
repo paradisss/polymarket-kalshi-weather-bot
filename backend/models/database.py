@@ -108,6 +108,7 @@ class SurvivalTrade(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     strategy = Column(String, index=True)
+    venue = Column(String, default="polymarket_us", index=True)
     market_id = Column(String, index=True)
     slug = Column(String, nullable=True)
     timeframe = Column(String, index=True)
@@ -130,6 +131,36 @@ class SurvivalTrade(Base):
     pnl = Column(Float, nullable=True)
     exit_price = Column(Float, nullable=True)   # bid sold at (take-profit / stop) - None if held to settlement
     exit_reason = Column(String, nullable=True)  # "take_profit", "stop_loss", "settled"
+    fee_coef = Column(Float, nullable=True)        # venue taker fee coefficient at entry
+    price_to_beat = Column(Float, nullable=True)   # window open on the settlement index
+    index_at_entry = Column(Float, nullable=True)  # settlement index (BRTI) when the trade opened
+
+
+class LiveTrade(Base):
+    """Real-money orders on Polymarket US, mirrored from PROVEN survival strategies only."""
+    __tablename__ = "live_trades"
+
+    id = Column(Integer, primary_key=True, index=True)
+    strategy = Column(String, index=True)
+    slug = Column(String, index=True)
+    timeframe = Column(String)
+    window_end = Column(DateTime, nullable=True)
+    opened_at = Column(DateTime, default=datetime.utcnow, index=True)
+    direction = Column(String)
+    limit_price = Column(Float)          # side price we were willing to pay
+    quantity = Column(Integer)           # shares requested
+    filled = Column(Float, default=0.0)  # shares filled
+    avg_price = Column(Float, nullable=True)
+    cost = Column(Float, default=0.0)    # cash spent incl. fee (estimated from fills)
+    order_id = Column(String, nullable=True)
+    status = Column(String, default="new")  # new, filled, partial, unfilled, rejected, error
+    error = Column(String, nullable=True)
+    exit_order_id = Column(String, nullable=True)
+    exit_price = Column(Float, nullable=True)
+    settled = Column(Boolean, default=False, index=True)
+    settled_at = Column(DateTime, nullable=True)
+    outcome = Column(String, nullable=True)
+    pnl = Column(Float, nullable=True)
 
 
 class AILog(Base):
@@ -204,6 +235,23 @@ def ensure_schema():
         with engine.connect() as conn:
             with conn.begin():
                 conn.execute(text("ALTER TABLE trades ADD COLUMN market_type VARCHAR DEFAULT 'btc'"))
+
+    # Survival-trade columns added after the table first shipped
+    try:
+        sv_columns = [col["name"] for col in inspector.get_columns("survival_trades")]
+    except Exception:
+        sv_columns = []
+    if sv_columns:
+        with engine.connect() as conn:
+            for col, coltype in [("venue", "VARCHAR"), ("exit_price", "FLOAT"), ("exit_reason", "VARCHAR"),
+                                 ("fee_coef", "FLOAT"), ("price_to_beat", "FLOAT"),
+                                 ("index_at_entry", "FLOAT")]:
+                if col not in sv_columns:
+                    try:
+                        with conn.begin():
+                            conn.execute(text(f"ALTER TABLE survival_trades ADD COLUMN {col} {coltype}"))
+                    except Exception:
+                        pass
 
     # Add calibration columns to signals table
     try:

@@ -352,6 +352,10 @@ async def settlement_job():
                 sv = await settle_survival_trades(db)
                 if sv:
                     log_event("success", f"Survival: settled {sv} paper trades")
+                from backend.core.us_live import settle_live_trades
+                lv = await settle_live_trades(db)
+                if lv:
+                    log_event("success", f"Live (Polymarket US): settled {lv} trades")
             except Exception as e:
                 logger.warning(f"Survival settlement failed: {e}")
 
@@ -391,6 +395,22 @@ async def settlement_job():
     except Exception as e:
         log_event("error", f"Settlement error: {str(e)}")
         logger.exception("Error in settlement_job")
+
+
+async def survival_job():
+    """Survival mode on Polymarket US: paper exits/entries every SURVIVAL_INTERVAL_SECONDS."""
+    try:
+        from backend.core.survival import run_survival_cycle
+        res = await run_survival_cycle()
+        if res.get("opened") or res.get("exited"):
+            log_event("data", f"Survival (Polymarket US): opened {len(res.get('opened', []))}, "
+                              f"closed early {len(res.get('exited', []))}", res)
+        live = res.get("live") or {}
+        if live.get("placed") or live.get("errors"):
+            log_event("warning" if live.get("errors") else "success", f"Live (Polymarket US): {live}")
+    except Exception as e:
+        log_event("error", f"Survival error: {e}")
+        logger.exception("Error in survival_job")
 
 
 async def heartbeat_job():
@@ -447,6 +467,15 @@ def start_scheduler():
         replace_existing=True,
         max_instances=1
     )
+
+    if settings.SURVIVAL_ENABLED:
+        scheduler.add_job(
+            survival_job,
+            IntervalTrigger(seconds=settings.SURVIVAL_INTERVAL_SECONDS),
+            id="survival_us",
+            replace_existing=True,
+            max_instances=1,
+        )
 
     # Heartbeat every minute
     scheduler.add_job(

@@ -528,15 +528,6 @@ async def scan_for_signals() -> List[TradingSignal]:
     # Persist signals with non-zero edge to DB for calibration tracking
     _persist_signals(signals)
 
-    # Survival mode: paper-trade the candidate strategies (ask + taker fee, risk rules)
-    try:
-        from backend.core.survival import record_survival_trades
-        n = record_survival_trades(signals)
-        if n:
-            logger.info(f"Survival: opened {n} paper trades")
-    except Exception as e:
-        logger.warning(f"Survival recording failed: {e}")
-
     return signals
 
 

@@ -59,6 +59,20 @@ class Settings(BaseSettings):
     BTC_TF_MIN_ELAPSED: str = "5m:0.6,15m:0.75,1h:0.75,1d:0.5"
     BTC_MAX_SPREAD: float = 0.05        # skip windows whose Up book is wider than this
 
+    # Survival mode (paper strategies on Polymarket US books, BRTI settlement)
+    SURVIVAL_ENABLED: bool = True
+    SURVIVAL_INTERVAL_SECONDS: int = 20
+
+    # Real money on Polymarket US - OFF unless every one of these is set. Orders are only placed
+    # for strategies listed in US_LIVE_STRATEGIES that the survival scoreboard marks PROVEN.
+    US_LIVE_TRADING: bool = False
+    POLYMARKET_US_KEY_ID: str = ""
+    POLYMARKET_US_SECRET_KEY: str = ""
+    US_LIVE_STRATEGIES: str = ""        # comma-separated, e.g. "favorite_late"
+    US_LIVE_MAX_STAKE: float = 5.0      # dollars per trade
+    US_LIVE_DAILY_LOSS: float = 20.0    # stop for the day after losing this much
+    US_LIVE_MAX_OPEN: int = 3           # open live positions at once
+
     # Risk management
     DAILY_LOSS_LIMIT: float = 300.0
     MAX_TRADE_SIZE: float = 75.0
