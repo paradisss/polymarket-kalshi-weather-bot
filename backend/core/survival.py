@@ -40,6 +40,8 @@ STRATEGIES: Dict[str, str] = {
     "underdog_late": "Control: buy the underdog (mid <= 15%) in the last 20% of the window",
     "dip_tp80": "Buy low (ask 20-40c, 15-60% into the window), sell when the bid reaches 80c, else hold",
     "dip_tp80_sl": "Same as dip_tp80 but also cut the loss if the bid falls to 10c",
+    "late_gap": "Last 20% of the window: buy the side the BRTI model prices >= 10 pts above its ask (ask <= 70c)",
+    "late_gap_big": "Last 20% of the window: buy the side the BRTI model prices >= 20 pts above its ask (ask <= 70c)",
 }
 
 # Exit rules for strategies that sell before settlement: (take-profit bid, stop-loss bid or None)
@@ -133,6 +135,16 @@ def choose(strategy: str, q: Quote) -> Optional[str]:
                 ask, _, _, mod = q.side(s)
                 if mod - ask >= 0.08 and ask <= 0.95:
                     return s
+    elif strategy in ("late_gap", "late_gap_big"):
+        need = 0.10 if strategy == "late_gap" else 0.20
+        if el >= 0.8 and q.model_up is not None:
+            best = None
+            for s in ("up", "down"):
+                ask, _, _, mod = q.side(s)
+                if ask <= 0.70 and mod - ask >= need and (best is None or mod - ask > best[1]):
+                    best = (s, mod - ask)
+            if best:
+                return best[0]
     elif strategy in ("dip_tp80", "dip_tp80_sl"):
         if 0.15 <= el <= 0.6:
             for s in ("up", "down"):
