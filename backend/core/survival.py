@@ -9,6 +9,8 @@ Every trade buys the chosen side at its ask. Each strategy has its own virtual b
   * stake = 1% of the strategy's current bankroll
   * daily stop: no new trades once today's realized P&L <= -3% of the bankroll at day start
   * drawdown pause: the strategy stops for good once its bankroll falls 10% below its peak
+    (strategies listed in SURVIVAL_NO_PAUSE skip this so they can reach the 200-trade proof)
+Strategies listed in SURVIVAL_RETIRED take no new trades but stay on the scoreboard as RETIRED.
 A strategy is PROVEN only after >= 200 settled trades with the 95% lower bound of mean P&L per
 trade above zero. Real orders are only ever placed by backend/core/us_live.py, and only for
 PROVEN strategies when the owner has switched live trading on.
@@ -19,6 +21,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
+from backend.config import settings
 from backend.models.database import SessionLocal, SurvivalTrade
 
 logger = logging.getLogger("trading_bot")
@@ -46,6 +49,20 @@ STRATEGIES: Dict[str, str] = {
 
 # Exit rules for strategies that sell before settlement: (take-profit bid, stop-loss bid or None)
 EXITS = {"dip_tp80": (0.80, None), "dip_tp80_sl": (0.80, 0.10)}
+
+
+def _csv(value: Optional[str]) -> set:
+    return {s.strip() for s in (value or "").split(",") if s.strip()}
+
+
+def retired() -> set:
+    """Strategies that take no new trades (history kept, shown as RETIRED)."""
+    return _csv(getattr(settings, "SURVIVAL_RETIRED", ""))
+
+
+def pause_exempt() -> set:
+    """Strategies that keep trading past the 10% drawdown pause (the daily stop still applies)."""
+    return _csv(getattr(settings, "SURVIVAL_NO_PAUSE", ""))
 
 
 def taker_fee(shares: float, price: float, coef: float = DEFAULT_FEE_COEF) -> float:
@@ -177,8 +194,10 @@ def _bankroll_state(db, strategy: str) -> dict:
     return {"bankroll": bank, "peak": peak, "today_pnl": today_pnl, "day_start": day_start}
 
 
-def _blocked(st: dict) -> Optional[str]:
-    if st["bankroll"] <= st["peak"] * (1 - DRAWDOWN_PAUSE_FRAC):
+def _blocked(st: dict, strategy: Optional[str] = None) -> Optional[str]:
+    if strategy in retired():
+        return "retired"
+    if st["bankroll"] <= st["peak"] * (1 - DRAWDOWN_PAUSE_FRAC) and strategy not in pause_exempt():
         return "paused: 10% drawdown"
     if st["today_pnl"] <= -DAILY_STOP_FRAC * st["day_start"]:
         return "daily stop: -3% today"
@@ -221,7 +240,7 @@ def record_survival_trades(quotes: List[Quote]) -> dict:
         exited = _apply_exits(db, quotes)
         for strat in STRATEGIES:
             st = _bankroll_state(db, strat)
-            if _blocked(st):
+            if _blocked(st, strat):
                 continue
             for q in quotes:
                 side = choose(strat, q)
@@ -330,8 +349,10 @@ def strategy_stats(db, strat: str) -> dict:
     upper95 = mean + 1.96 * sd / math.sqrt(n) if n > 1 else None
     staked = sum(r.stake for r in settled)
     st = _bankroll_state(db, strat)
-    blocked = _blocked(st)
-    if blocked and blocked.startswith("paused"):
+    blocked = _blocked(st, strat)
+    if blocked == "retired":
+        status = "RETIRED"
+    elif blocked and blocked.startswith("paused"):
         status = "PAUSED"
     elif n >= MIN_PROOF_TRADES and lower95 is not None and lower95 > 0:
         status = "PROVEN"
@@ -357,6 +378,7 @@ def strategy_stats(db, strat: str) -> dict:
         "drawdown": (1 - st["bankroll"] / st["peak"]) if st["peak"] else 0.0,
         "today_pnl": round(st["today_pnl"], 2), "by_timeframe": by_tf,
         "needs": max(0, MIN_PROOF_TRADES - n),
+        "pause_exempt": strat in pause_exempt(),
         "exits": {k: sum(1 for r in settled if r.exit_reason == k)
                   for k in ("take_profit", "stop_loss", "settled")},
     }
@@ -378,6 +400,8 @@ def scoreboard(db) -> dict:
             "start_bankroll": START_BANKROLL, "stake_frac": STAKE_FRAC,
             "daily_stop_frac": DAILY_STOP_FRAC, "drawdown_pause_frac": DRAWDOWN_PAUSE_FRAC,
             "min_proof_trades": MIN_PROOF_TRADES,
+            "pause_exempt": sorted(pause_exempt() & set(STRATEGIES)),
+            "retired": sorted(retired() & set(STRATEGIES)),
             "fee": "shares x feeCoefficient (0.0695) x p x (1-p), on buys and early sells",
             "entry": "ask of the chosen side on the Polymarket US book",
             "settlement": "CF Benchmarks BRTI (same feed as Polymarket US)",
