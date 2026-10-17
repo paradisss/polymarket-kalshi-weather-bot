@@ -62,6 +62,10 @@ class Settings(BaseSettings):
     # Survival mode (paper strategies on Polymarket US books, BRTI settlement)
     SURVIVAL_ENABLED: bool = True
     SURVIVAL_INTERVAL_SECONDS: int = 20
+    # Keep testing these past the 10% drawdown pause (comma-separated; daily stop still applies)
+    SURVIVAL_NO_PAUSE: str = "model_gap"
+    # No new trades for these; history stays on the scoreboard as RETIRED (comma-separated)
+    SURVIVAL_RETIRED: str = "underdog_late,late_gap"
 
     # Real money on Polymarket US - OFF unless every one of these is set. Orders are only placed
     # for strategies listed in US_LIVE_STRATEGIES that the survival scoreboard marks PROVEN.
