@@ -262,8 +262,8 @@ class PolymarketUSClient:
     async def balances(self):
         return await self._req("GET", "/v1/account/balances")
 
-    async def positions(self):
-        return await self._req("GET", "/v1/portfolio/positions")
+    async def positions(self, market: Optional[str] = None):
+        return await self._req("GET", "/v1/portfolio/positions", query={"market": market} if market else None)
 
     async def order(self, order_id: str):
         return await self._req("GET", f"/v1/order/{order_id}")
