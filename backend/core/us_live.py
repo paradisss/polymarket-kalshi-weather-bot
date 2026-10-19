@@ -75,9 +75,13 @@ async def _run_probe(client, quotes) -> None:
         if not oid:
             _probe.update(ok=False, detail=f"no order id in response (keys: {sorted(res)[:10] if isinstance(res, dict) else type(res).__name__})")
             return
-        filled, px, state = await _fill_info(client, oid, "up")
+        filled, px, state, reason = await _fill(client, res, oid, "up")
         if state == "unknown":
-            _probe.update(ok=False, detail=f"order {oid} placed but lookup failed")
+            _probe.update(ok=False, detail=f"order {oid} placed but its fill could not be read "
+                                           f"(no executions in response; keys: {sorted(res)[:10]})")
+            return
+        if state == "ORDER_STATE_REJECTED":
+            _probe.update(ok=False, detail=f"order {oid} rejected: {reason or 'no reason given'}")
             return
         if filled > 0:
             # Shouldn't happen (ask was >= 5c), but if it does, track the position like any live trade.
@@ -116,6 +120,47 @@ def _num(x) -> Optional[float]:
         return float(x)
     except (TypeError, ValueError):
         return None
+
+
+def _fill_from_res(res, side: str):
+    """(filled shares, average price in the side's terms, state, reject reason) from the create-order
+    response. Orders are sent with synchronousExecution, so Polymarket US returns the executions inline;
+    an IOC order is closed at once and GET /v1/order/{id} then answers 404. None if no executions."""
+    ex = res.get("executions") if isinstance(res, dict) else None
+    if not isinstance(ex, list) or not ex:
+        return None
+    ex = [e for e in ex if isinstance(e, dict)]
+    orders = [e["order"] for e in ex if isinstance(e.get("order"), dict)]
+    reason = next((e.get("orderRejectReason") or e.get("text") for e in ex
+                   if e.get("type") == "EXECUTION_TYPE_REJECTED"), None)
+    filled, px, state = 0.0, None, (orders[-1].get("state", "") if orders else "")
+    if orders:
+        o = max(orders, key=lambda o: float(o.get("cumQuantity") or 0))
+        filled, px = float(o.get("cumQuantity") or 0), _num(o.get("avgPx"))
+        state = o.get("state", state)
+    if filled > 0 and px is None or not orders:
+        fills = [(float(e.get("lastShares") or 0), _num(e.get("lastPx"))) for e in ex
+                 if e.get("type") in ("EXECUTION_TYPE_FILL", "EXECUTION_TYPE_PARTIAL_FILL")]
+        fills = [(q, p) for q, p in fills if q > 0 and p is not None]
+        if fills:
+            filled = sum(q for q, _ in fills)
+            px = sum(q * p for q, p in fills) / filled
+    if px is not None and side == "down":
+        px = 1 - px  # API reports the long (Up) price
+    if reason and not state:
+        state = "ORDER_STATE_REJECTED"
+    return filled, px, state, reason
+
+
+async def _fill(client, res, oid, side: str):
+    """Fill info from the create response, else from an order lookup (works only while the order exists)."""
+    info = _fill_from_res(res, side)
+    if info is not None:
+        return info
+    if not oid:
+        return 0.0, None, "unknown", None
+    filled, px, state = await _fill_info(client, oid, side)
+    return filled, px, state, None
 
 
 async def _fill_info(client, order_id: str, side: str):
@@ -203,7 +248,7 @@ async def mirror_live(summary: dict, quotes) -> dict:
                 res = await client.create_order(slug, side, "sell", bid, int(lt.filled),
                                                 tick=q.tick if q else 0.01)
                 lt.exit_order_id = _order_id(res)
-                sold, px, _ = await _fill_info(client, lt.exit_order_id, side)
+                sold, px, _, _ = await _fill(client, res, lt.exit_order_id, side)
                 if sold > 0 and px is not None:
                     coef = q.fee_coef if q else DEFAULT_FEE_COEF
                     proceeds = sold * px - sold * coef * px * (1 - px)
@@ -254,7 +299,9 @@ async def mirror_live(summary: dict, quotes) -> dict:
             try:
                 res = await client.create_order(slug, side, "buy", ask, qty, tick=q.tick if q else 0.01)
                 lt.order_id = _order_id(res)
-                filled, px, state = await _fill_info(client, lt.order_id, side) if lt.order_id else (0.0, None, "unknown")
+                filled, px, state, reason = await _fill(client, res, lt.order_id, side)
+                if reason:
+                    lt.error = f"rejected: {reason}"[:500]
                 if state == "unknown":
                     # Can't confirm the fill: assume the worst (fully filled at the limit) so the
                     # open-position and loss caps still count it; settlement scores it normally.
