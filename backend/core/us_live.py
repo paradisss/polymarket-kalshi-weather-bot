@@ -22,6 +22,7 @@ from backend.config import settings
 from backend.models.database import SessionLocal, LiveTrade
 
 logger = logging.getLogger("trading_bot")
+DEFAULT_FEE_COEF_LIVE = 0.0695  # Polymarket US BTC Up/Down feeCoefficient
 
 
 def _allowed() -> List[str]:
@@ -62,7 +63,9 @@ async def _run_probe(client, quotes) -> None:
     import time
     if _probe["ok"] is True or (_probe["ok"] is False and time.time() - _probe["at"] < 600):
         return
-    q = next((q for q in quotes if getattr(q, "slug", None)), None)
+    # Only probe a live window whose Up ask is well above 1c, so the 1c IOC buy cannot fill.
+    q = next((q for q in quotes if getattr(q, "slug", None) and (getattr(q, "up_ask", None) or 0) >= 0.05
+              and getattr(q, "is_active", True)), None)
     if q is None:
         return
     _probe["at"] = time.time()
@@ -76,6 +79,17 @@ async def _run_probe(client, quotes) -> None:
         if state == "unknown":
             _probe.update(ok=False, detail=f"order {oid} placed but lookup failed")
             return
+        if filled > 0:
+            # Shouldn't happen (ask was >= 5c), but if it does, track the position like any live trade.
+            db = SessionLocal()
+            try:
+                db.add(LiveTrade(strategy="probe", slug=q.slug, timeframe=getattr(q, "timeframe", None),
+                                 window_end=getattr(q, "window_end", None), direction="up", limit_price=0.01,
+                                 quantity=1, order_id=oid, filled=filled, avg_price=px or 0.01,
+                                 cost=filled * (px or 0.01), status="filled"))
+                db.commit()
+            finally:
+                db.close()
         _probe.update(ok=True, detail=f"order {oid} state={state} filled={filled} on {q.slug}")
         logger.info(f"Live: probe ok - {_probe['detail']}")
     except Exception as e:
@@ -131,8 +145,35 @@ def _eligible(db, strat: str) -> Optional[str]:
 
 
 def _total_live_pnl(db) -> float:
+    """All-time live P&L for the kill switch; unconfirmed fills count as a total loss of their cost."""
     rows = db.query(LiveTrade.pnl).filter(LiveTrade.settled == True).all()  # noqa: E712
-    return sum(r[0] or 0.0 for r in rows)
+    unconf = db.query(LiveTrade.cost).filter(LiveTrade.settled == False,  # noqa: E712
+                                             LiveTrade.status == "unconfirmed").all()
+    return sum(r[0] or 0.0 for r in rows) - sum(r[0] or 0.0 for r in unconf)
+
+
+async def _reconcile_unconfirmed(db, client) -> int:
+    """Re-read unconfirmed orders from the venue; returns how many are still unconfirmed."""
+    left = 0
+    for lt in db.query(LiveTrade).filter(LiveTrade.settled == False,  # noqa: E712
+                                         LiveTrade.status == "unconfirmed").all():
+        if not lt.order_id:
+            left += 1
+            continue
+        filled, px, state = await _fill_info(client, lt.order_id, lt.direction)
+        if state == "unknown":
+            left += 1
+            continue
+        lt.filled, lt.avg_price, lt.error = filled, px, None
+        if filled > 0 and px is not None:
+            coef = DEFAULT_FEE_COEF_LIVE
+            lt.cost = filled * px + filled * coef * px * (1 - px)
+            lt.status = "filled" if filled >= (lt.quantity or 0) else "partial"
+        else:
+            lt.status, lt.cost = "unfilled", 0.0
+            lt.settled, lt.settled_at, lt.pnl = True, datetime.utcnow(), 0.0
+    db.commit()
+    return left
 
 
 async def mirror_live(summary: dict, quotes) -> dict:
@@ -175,7 +216,10 @@ async def mirror_live(summary: dict, quotes) -> dict:
                 errors.append(f"sell {slug}: {e}")
             db.commit()
 
-        # 2) new entries
+        # 2) new entries - none while any fill is still unconfirmed
+        if await _reconcile_unconfirmed(db, client):
+            skipped.append("unconfirmed live fill - no new entries until it is reconciled")
+            return {"enabled": True, "placed": placed, "errors": errors, "skipped": skipped}
         day_pnl = _today_live_pnl(db)
         total_pnl = _total_live_pnl(db)
         for strat, slug, side, ask in summary.get("opened", []):
@@ -215,7 +259,7 @@ async def mirror_live(summary: dict, quotes) -> dict:
                     # Can't confirm the fill: assume the worst (fully filled at the limit) so the
                     # open-position and loss caps still count it; settlement scores it normally.
                     filled, px = float(qty), ask
-                    lt.error = "fill not confirmed - assumed filled at limit; check polymarket.us"
+                    lt.error = "fill not confirmed - counted as filled at limit for the caps; reconciling"
                 lt.filled, lt.avg_price = filled, px
                 if filled > 0 and px is not None:
                     lt.cost = filled * px + filled * coef * px * (1 - px)
@@ -238,7 +282,9 @@ async def settle_live_trades(db) -> int:
     """Score filled live positions held to settlement (Polymarket US pays $1/share to the winner)."""
     from backend.data.polymarket_us import fetch_us_resolution
     now = datetime.utcnow()
-    rows = db.query(LiveTrade).filter(LiveTrade.settled == False, LiveTrade.filled > 0).all()  # noqa: E712
+    from sqlalchemy import or_
+    rows = db.query(LiveTrade).filter(LiveTrade.settled == False, LiveTrade.filled > 0,  # noqa: E712
+                                      or_(LiveTrade.status.is_(None), LiveTrade.status != "unconfirmed")).all()
     done = 0
     for lt in rows:
         if lt.window_end and lt.window_end > now:
