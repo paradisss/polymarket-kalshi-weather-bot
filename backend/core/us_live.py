@@ -3,7 +3,11 @@
 Places a real order only when ALL of these hold:
   * US_LIVE_TRADING=true and POLYMARKET_US_KEY_ID / POLYMARKET_US_SECRET_KEY are set
   * the strategy is listed in US_LIVE_STRATEGIES
-  * the survival scoreboard marks that strategy PROVEN (>= 200 paper trades, 95% CI of mean P&L > 0)
+  * the survival scoreboard marks that strategy PROVEN (>= 200 paper trades, 95% CI of mean P&L > 0),
+    or the owner lists it in US_LIVE_ALLOW_UNPROVEN and it is still TESTING (not PAUSED/FAILING/RETIRED)
+  * all-time live P&L is above -US_LIVE_MAX_TOTAL_LOSS (kill switch)
+  * a one-share probe order (IOC buy at 1c, which normally cannot fill) has confirmed that order
+    placement and order lookup work with this key
   * the paper strategy just opened (or closed early) a trade in this cycle
   * today's realized live loss is under US_LIVE_DAILY_LOSS and fewer than US_LIVE_MAX_OPEN are open
 Orders are limit + immediate-or-cancel at the current ask (buys) or bid (early sells), at most
@@ -24,7 +28,24 @@ def _allowed() -> List[str]:
     return [s.strip() for s in (settings.US_LIVE_STRATEGIES or "").split(",") if s.strip()]
 
 
-def live_blockers() -> List[str]:
+def _unproven_ok() -> set:
+    return {s.strip() for s in (settings.US_LIVE_ALLOW_UNPROVEN or "").split(",") if s.strip()}
+
+
+# One-share probe: proves the order + lookup path before any real entry. Retried every 10 min on failure.
+_probe = {"ok": None, "at": 0.0, "detail": None}
+
+
+def _order_id(res) -> Optional[str]:
+    if not isinstance(res, dict):
+        return None
+    oid = res.get("id") or res.get("orderId") or res.get("order_id")
+    if not oid and isinstance(res.get("order"), dict):
+        oid = res["order"].get("id") or res["order"].get("orderId")
+    return str(oid) if oid else None
+
+
+def live_blockers(include_probe: bool = True) -> List[str]:
     out = []
     if not settings.US_LIVE_TRADING:
         out.append("US_LIVE_TRADING is off")
@@ -32,7 +53,34 @@ def live_blockers() -> List[str]:
         out.append("no Polymarket US API key")
     if not _allowed():
         out.append("US_LIVE_STRATEGIES is empty")
+    if include_probe and _probe["ok"] is False:
+        out.append(f"order probe failed: {_probe['detail']}")
     return out
+
+
+async def _run_probe(client, quotes) -> None:
+    import time
+    if _probe["ok"] is True or (_probe["ok"] is False and time.time() - _probe["at"] < 600):
+        return
+    q = next((q for q in quotes if getattr(q, "slug", None)), None)
+    if q is None:
+        return
+    _probe["at"] = time.time()
+    try:
+        res = await client.create_order(q.slug, "up", "buy", 0.01, 1, tick=getattr(q, "tick", 0.01) or 0.01)
+        oid = _order_id(res)
+        if not oid:
+            _probe.update(ok=False, detail=f"no order id in response (keys: {sorted(res)[:10] if isinstance(res, dict) else type(res).__name__})")
+            return
+        filled, px, state = await _fill_info(client, oid, "up")
+        if state == "unknown":
+            _probe.update(ok=False, detail=f"order {oid} placed but lookup failed")
+            return
+        _probe.update(ok=True, detail=f"order {oid} state={state} filled={filled} on {q.slug}")
+        logger.info(f"Live: probe ok - {_probe['detail']}")
+    except Exception as e:
+        _probe.update(ok=False, detail=str(e)[:200])
+        logger.warning(f"Live: probe failed: {e}")
 
 
 def _client():
@@ -71,13 +119,24 @@ async def _fill_info(client, order_id: str, side: str):
     return filled, px, o.get("state", "")
 
 
-def _proven(db, strat: str) -> bool:
+def _eligible(db, strat: str) -> Optional[str]:
+    """None if the strategy may trade live now, else the reason it may not."""
     from backend.core.survival import strategy_stats
-    return strategy_stats(db, strat)["status"] == "PROVEN"
+    st = strategy_stats(db, strat)["status"]
+    if st == "PROVEN":
+        return None
+    if strat in _unproven_ok() and st == "TESTING":
+        return None
+    return f"{strat} is {st}" + ("" if strat in _unproven_ok() else " (not PROVEN)")
+
+
+def _total_live_pnl(db) -> float:
+    rows = db.query(LiveTrade.pnl).filter(LiveTrade.settled == True).all()  # noqa: E712
+    return sum(r[0] or 0.0 for r in rows)
 
 
 async def mirror_live(summary: dict, quotes) -> dict:
-    blockers = live_blockers()
+    blockers = live_blockers(include_probe=False)
     if blockers:
         return {"enabled": False, "blockers": blockers}
     from backend.core.survival import DEFAULT_FEE_COEF
@@ -87,6 +146,9 @@ async def mirror_live(summary: dict, quotes) -> dict:
     db = SessionLocal()
     try:
         client = _client()
+        await _run_probe(client, quotes)
+        if _probe["ok"] is not True:
+            return {"enabled": False, "blockers": live_blockers() or ["order probe pending"]}
         # 1) early exits (take-profit / stop-loss) for live positions of strategies that just exited
         for strat, slug, side, reason, bid in summary.get("exited", []):
             lt = (db.query(LiveTrade).filter(LiveTrade.strategy == strat, LiveTrade.slug == slug,
@@ -99,7 +161,7 @@ async def mirror_live(summary: dict, quotes) -> dict:
                 q = by_slug.get(slug)
                 res = await client.create_order(slug, side, "sell", bid, int(lt.filled),
                                                 tick=q.tick if q else 0.01)
-                lt.exit_order_id = res.get("id")
+                lt.exit_order_id = _order_id(res)
                 sold, px, _ = await _fill_info(client, lt.exit_order_id, side)
                 if sold > 0 and px is not None:
                     coef = q.fee_coef if q else DEFAULT_FEE_COEF
@@ -115,12 +177,17 @@ async def mirror_live(summary: dict, quotes) -> dict:
 
         # 2) new entries
         day_pnl = _today_live_pnl(db)
+        total_pnl = _total_live_pnl(db)
         for strat, slug, side, ask in summary.get("opened", []):
             if strat not in allowed:
                 continue
-            if not _proven(db, strat):
-                skipped.append(f"{strat} not PROVEN yet")
+            why = _eligible(db, strat)
+            if why:
+                skipped.append(why)
                 continue
+            if total_pnl <= -settings.US_LIVE_MAX_TOTAL_LOSS:
+                skipped.append("total live loss limit reached (kill switch)")
+                break
             if day_pnl <= -settings.US_LIVE_DAILY_LOSS:
                 skipped.append("daily live loss limit reached")
                 break
@@ -142,12 +209,18 @@ async def mirror_live(summary: dict, quotes) -> dict:
             db.add(lt)
             try:
                 res = await client.create_order(slug, side, "buy", ask, qty, tick=q.tick if q else 0.01)
-                lt.order_id = res.get("id")
-                filled, px, state = await _fill_info(client, lt.order_id, side)
+                lt.order_id = _order_id(res)
+                filled, px, state = await _fill_info(client, lt.order_id, side) if lt.order_id else (0.0, None, "unknown")
+                if state == "unknown":
+                    # Can't confirm the fill: assume the worst (fully filled at the limit) so the
+                    # open-position and loss caps still count it; settlement scores it normally.
+                    filled, px = float(qty), ask
+                    lt.error = "fill not confirmed - assumed filled at limit; check polymarket.us"
                 lt.filled, lt.avg_price = filled, px
                 if filled > 0 and px is not None:
                     lt.cost = filled * px + filled * coef * px * (1 - px)
-                lt.status = "filled" if filled >= qty else ("partial" if filled > 0 else "unfilled")
+                lt.status = ("unconfirmed" if state == "unknown" else
+                             "filled" if filled >= qty else ("partial" if filled > 0 else "unfilled"))
                 if filled <= 0:
                     lt.settled, lt.settled_at, lt.pnl = True, datetime.utcnow(), 0.0
                 placed.append(("buy", strat, slug, side, ask, qty, lt.status))
@@ -196,6 +269,9 @@ def live_status(db) -> dict:
         "max_stake": settings.US_LIVE_MAX_STAKE,
         "daily_loss_limit": settings.US_LIVE_DAILY_LOSS,
         "max_open": settings.US_LIVE_MAX_OPEN,
+        "max_total_loss": settings.US_LIVE_MAX_TOTAL_LOSS,
+        "allow_unproven": sorted(_unproven_ok()),
+        "probe": {"ok": _probe["ok"], "detail": _probe["detail"]},
         "today_pnl": round(_today_live_pnl(db), 2),
         "total_pnl": round(sum(r[0] or 0.0 for r in settled), 2),
         "recent": [{
