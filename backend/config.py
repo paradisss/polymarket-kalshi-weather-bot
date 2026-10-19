@@ -68,7 +68,8 @@ class Settings(BaseSettings):
     SURVIVAL_RETIRED: str = "underdog_late,late_gap"
 
     # Real money on Polymarket US - OFF unless every one of these is set. Orders are only placed
-    # for strategies listed in US_LIVE_STRATEGIES that the survival scoreboard marks PROVEN.
+    # for strategies listed in US_LIVE_STRATEGIES that the survival scoreboard marks PROVEN
+    # (or TESTING, for strategies the owner lists in US_LIVE_ALLOW_UNPROVEN).
     US_LIVE_TRADING: bool = False
     POLYMARKET_US_KEY_ID: str = ""
     POLYMARKET_US_SECRET_KEY: str = ""
@@ -76,6 +77,9 @@ class Settings(BaseSettings):
     US_LIVE_MAX_STAKE: float = 5.0      # dollars per trade
     US_LIVE_DAILY_LOSS: float = 20.0    # stop for the day after losing this much
     US_LIVE_MAX_OPEN: int = 3           # open live positions at once
+    # Owner-approved exception: these may trade live while still TESTING (never PAUSED/FAILING/RETIRED)
+    US_LIVE_ALLOW_UNPROVEN: str = ""    # comma-separated, e.g. "model_gap"
+    US_LIVE_MAX_TOTAL_LOSS: float = 50.0  # kill switch: no new live entries once all-time live P&L <= -this
 
     # Risk management
     DAILY_LOSS_LIMIT: float = 300.0
