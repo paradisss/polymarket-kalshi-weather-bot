@@ -70,15 +70,18 @@ async def _run_probe(client, quotes) -> None:
         return
     _probe["at"] = time.time()
     try:
+        before = await _net_position(client, q.slug)
+        if before is None:
+            _probe.update(ok=False, detail="could not read positions (GET /v1/portfolio/positions)")
+            return
         res = await client.create_order(q.slug, "up", "buy", 0.01, 1, tick=getattr(q, "tick", 0.01) or 0.01)
         oid = _order_id(res)
         if not oid:
             _probe.update(ok=False, detail=f"no order id in response (keys: {sorted(res)[:10] if isinstance(res, dict) else type(res).__name__})")
             return
-        filled, px, state, reason = await _fill(client, res, oid, "up")
+        filled, px, state, reason = await _verified_fill(client, res, q.slug, "up", before, 0.01)
         if state == "unknown":
-            _probe.update(ok=False, detail=f"order {oid} placed but its fill could not be read "
-                                           f"(no executions in response; keys: {sorted(res)[:10]})")
+            _probe.update(ok=False, detail=f"order {oid} placed but its fill could not be confirmed")
             return
         if state == "ORDER_STATE_REJECTED":
             _probe.update(ok=False, detail=f"order {oid} rejected: {reason or 'no reason given'}")
@@ -152,15 +155,61 @@ def _fill_from_res(res, side: str):
     return filled, px, state, reason
 
 
-async def _fill(client, res, oid, side: str):
-    """Fill info from the create response, else from an order lookup (works only while the order exists)."""
-    info = _fill_from_res(res, side)
-    if info is not None:
-        return info
-    if not oid:
-        return 0.0, None, "unknown", None
-    filled, px, state = await _fill_info(client, oid, side)
-    return filled, px, state, None
+_TERMINAL = {"ORDER_STATE_FILLED", "ORDER_STATE_CANCELED", "ORDER_STATE_REJECTED", "ORDER_STATE_EXPIRED"}
+
+
+async def _net_position(client, slug: str) -> Optional[float]:
+    """Net shares held in one market (long > 0, short < 0) from GET /v1/portfolio/positions; None on error."""
+    try:
+        d = await client.positions(market=slug)
+    except Exception as e:
+        logger.warning(f"Live: positions read failed for {slug}: {e}")
+        return None
+    pos = d.get("positions") if isinstance(d, dict) else None
+    if pos is None:
+        return None
+    items = list(pos.items()) if isinstance(pos, dict) else [(None, v) for v in pos] if isinstance(pos, list) else []
+    for key, v in items:
+        if not isinstance(v, dict):
+            continue
+        vslug = key or v.get("marketSlug") or (v.get("marketMetadata") or {}).get("slug")
+        if vslug == slug or (v.get("marketMetadata") or {}).get("slug") == slug:
+            try:
+                return float(v.get("netPosition") or 0)
+            except (TypeError, ValueError):
+                return None
+    return 0.0
+
+
+async def _verified_fill(client, res, slug: str, side: str, before: Optional[float], limit_px: float):
+    """(filled shares, avg price in side terms, state, reject reason) for an order just sent.
+
+    The position change in the market is the ground truth: Polymarket US's synchronous reply can stop
+    at ORDER_STATE_NEW, and a closed IOC order can't be looked up (404). The reply's executions are used
+    when they reach a final state; otherwise the position is re-read (up to ~3 s). If neither can
+    confirm the fill, state is "unknown" and the caller treats it as unconfirmed."""
+    import asyncio
+    info = _fill_from_res(res, side) if res is not None else None
+    r_filled, r_px, r_state, reason = info if info else (0.0, None, "", None)
+    final = r_state in _TERMINAL or (r_state == "ORDER_STATE_PARTIALLY_FILLED" and r_filled > 0)
+    delta = None
+    if before is not None:
+        for i in range(3):
+            after = await _net_position(client, slug)
+            if after is None:
+                break
+            delta = abs(after - before)
+            if delta > 0 or final:
+                break
+            await asyncio.sleep(1.0)
+    if delta is None and not final:
+        return 0.0, None, "unknown", reason
+    filled = max(r_filled, delta or 0.0)
+    if final and delta is not None and abs((delta or 0) - r_filled) > 1e-9:
+        logger.warning(f"Live: {slug} reply says {r_filled} filled, position moved {delta}; using {filled}")
+    px = r_px if (r_px is not None and filled > 0) else (limit_px if filled > 0 else None)
+    state = r_state if final else ("ORDER_STATE_FILLED" if filled > 0 else "ORDER_STATE_CANCELED")
+    return filled, px, state, reason
 
 
 async def _fill_info(client, order_id: str, side: str):
@@ -202,14 +251,13 @@ async def _reconcile_unconfirmed(db, client) -> int:
     left = 0
     for lt in db.query(LiveTrade).filter(LiveTrade.settled == False,  # noqa: E712
                                          LiveTrade.status == "unconfirmed").all():
-        if not lt.order_id:
+        net = await _net_position(client, lt.slug)
+        if net is None:
             left += 1
             continue
-        filled, px, state = await _fill_info(client, lt.order_id, lt.direction)
-        if state == "unknown":
-            left += 1
-            continue
-        lt.filled, lt.avg_price, lt.error = filled, px, None
+        # Assumes only this bot trades these 15m/1h windows on the account.
+        filled, px = abs(net), lt.limit_price
+        lt.filled, lt.avg_price, lt.error = filled, px, f"reconciled from position: {filled} shares"
         if filled > 0 and px is not None:
             coef = DEFAULT_FEE_COEF_LIVE
             lt.cost = filled * px + filled * coef * px * (1 - px)
@@ -245,10 +293,11 @@ async def mirror_live(summary: dict, quotes) -> dict:
                 continue
             try:
                 q = by_slug.get(slug)
+                before = await _net_position(client, slug)
                 res = await client.create_order(slug, side, "sell", bid, int(lt.filled),
                                                 tick=q.tick if q else 0.01)
                 lt.exit_order_id = _order_id(res)
-                sold, px, _, _ = await _fill(client, res, lt.exit_order_id, side)
+                sold, px, _, _ = await _verified_fill(client, res, slug, side, before, bid)
                 if sold > 0 and px is not None:
                     coef = q.fee_coef if q else DEFAULT_FEE_COEF
                     proceeds = sold * px - sold * coef * px * (1 - px)
@@ -292,6 +341,10 @@ async def mirror_live(summary: dict, quotes) -> dict:
             if qty < 1:
                 skipped.append(f"{slug}: stake cap below one share")
                 continue
+            before = await _net_position(client, slug)
+            if before is None:
+                skipped.append(f"{slug}: could not read positions - no order sent")
+                continue
             lt = LiveTrade(strategy=strat, slug=slug, timeframe=q.timeframe if q else None,
                            window_end=q.window_end if q else None, direction=side,
                            limit_price=ask, quantity=qty)
@@ -299,7 +352,7 @@ async def mirror_live(summary: dict, quotes) -> dict:
             try:
                 res = await client.create_order(slug, side, "buy", ask, qty, tick=q.tick if q else 0.01)
                 lt.order_id = _order_id(res)
-                filled, px, state, reason = await _fill(client, res, lt.order_id, side)
+                filled, px, state, reason = await _verified_fill(client, res, slug, side, before, ask)
                 if reason:
                     lt.error = f"rejected: {reason}"[:500]
                 if state == "unknown":
@@ -316,8 +369,17 @@ async def mirror_live(summary: dict, quotes) -> dict:
                     lt.settled, lt.settled_at, lt.pnl = True, datetime.utcnow(), 0.0
                 placed.append(("buy", strat, slug, side, ask, qty, lt.status))
             except Exception as e:
-                lt.status, lt.error = "error", str(e)[:500]
-                lt.settled, lt.settled_at, lt.pnl = True, datetime.utcnow(), 0.0
+                # The request may have reached the venue (e.g. a timeout): check the position before
+                # writing it off, so a real fill is never left untracked.
+                filled, px, state, _ = await _verified_fill(client, None, slug, side, before, ask)
+                if state == "unknown" or filled > 0:
+                    lt.filled, lt.avg_price = (float(qty), ask) if state == "unknown" else (filled, px)
+                    lt.cost = lt.filled * lt.avg_price + lt.filled * coef * lt.avg_price * (1 - lt.avg_price)
+                    lt.status = "unconfirmed" if state == "unknown" else ("filled" if filled >= qty else "partial")
+                    lt.error = f"order call failed but position check: {state}, filled {filled}: {e}"[:500]
+                else:
+                    lt.status, lt.error = "error", str(e)[:500]
+                    lt.settled, lt.settled_at, lt.pnl = True, datetime.utcnow(), 0.0
                 errors.append(f"buy {slug}: {e}")
             db.commit()
     finally:
