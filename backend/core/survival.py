@@ -65,6 +65,22 @@ def pause_exempt() -> set:
     return _csv(getattr(settings, "SURVIVAL_NO_PAUSE", ""))
 
 
+def timeframe_limits() -> Dict[str, set]:
+    """SURVIVAL_TIMEFRAMES "model_gap:1h,favorite_late:15m|1h" -> {strategy: {window lengths it may trade}}."""
+    out: Dict[str, set] = {}
+    for part in _csv(getattr(settings, "SURVIVAL_TIMEFRAMES", "")):
+        name, _, tfs = part.partition(":")
+        allowed = {t.strip() for t in tfs.split("|") if t.strip()}
+        if name.strip() and allowed:
+            out[name.strip()] = allowed
+    return out
+
+
+def allowed_on(strategy: str, timeframe: str, limits: Optional[Dict[str, set]] = None) -> bool:
+    lim = timeframe_limits() if limits is None else limits
+    return strategy not in lim or timeframe in lim[strategy]
+
+
 def taker_fee(shares: float, price: float, coef: float = DEFAULT_FEE_COEF) -> float:
     return shares * coef * price * (1 - price)
 
@@ -238,11 +254,14 @@ def record_survival_trades(quotes: List[Quote]) -> dict:
     opened, exited = [], []
     try:
         exited = _apply_exits(db, quotes)
+        limits = timeframe_limits()
         for strat in STRATEGIES:
             st = _bankroll_state(db, strat)
             if _blocked(st, strat):
                 continue
             for q in quotes:
+                if not allowed_on(strat, q.timeframe, limits):
+                    continue
                 side = choose(strat, q)
                 if not side:
                     continue
@@ -402,6 +421,7 @@ def scoreboard(db) -> dict:
             "min_proof_trades": MIN_PROOF_TRADES,
             "pause_exempt": sorted(pause_exempt() & set(STRATEGIES)),
             "retired": sorted(retired() & set(STRATEGIES)),
+            "timeframes": {k: sorted(v) for k, v in timeframe_limits().items() if k in STRATEGIES},
             "fee": "shares x feeCoefficient (0.0695) x p x (1-p), on buys and early sells",
             "entry": "ask of the chosen side on the Polymarket US book",
             "settlement": "CF Benchmarks BRTI (same feed as Polymarket US)",

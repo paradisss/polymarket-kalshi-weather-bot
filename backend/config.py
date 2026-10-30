@@ -66,6 +66,9 @@ class Settings(BaseSettings):
     SURVIVAL_NO_PAUSE: str = "model_gap"
     # No new trades for these; history stays on the scoreboard as RETIRED (comma-separated)
     SURVIVAL_RETIRED: str = "underdog_late,late_gap"
+    # Limit strategies to some window lengths: "strategy:tf|tf,strategy2:tf" (tf = 15m, 1h, 1d).
+    # Strategies not listed trade every window length. E.g. "model_gap:1h".
+    SURVIVAL_TIMEFRAMES: str = ""
 
     # Real money on Polymarket US - OFF unless every one of these is set. Orders are only placed
     # for strategies listed in US_LIVE_STRATEGIES that the survival scoreboard marks PROVEN
