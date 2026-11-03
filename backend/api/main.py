@@ -691,7 +691,8 @@ async def get_us_markets():
             "price_to_beat": q.price_to_beat,
             "distance": (q.brti - q.price_to_beat) if (q.brti and q.price_to_beat) else None,
             "up_bid": q.up_bid, "up_ask": q.up_ask, "market_up": q.mid,
-            "model_up": q.model_up, "fee_coef": q.fee_coef,
+            "model_up": q.model_up, "model_v5_up": q.model_v5, "book_imbalance": q.v5_imbalance,
+            "fee_coef": q.fee_coef,
             "url": f"https://polymarket.us/event/{q.slug.removeprefix('cpc-')}",
         } for q in sorted(quotes, key=lambda x: ["15m", "1h", "1d"].index(x.timeframe))],
         "generated_at": datetime.utcnow().isoformat() + "Z",
@@ -705,6 +706,20 @@ async def get_us_account():
     res = await check_key()
     res["live_blockers"] = live_blockers()
     return res
+
+
+@app.get("/api/model/v5")
+async def get_model_v5(db: Session = Depends(get_db)):
+    """Model v5: current weights (backtested default or latest accepted refit), recorded rows, refit history."""
+    from backend.core.model_v5 import status
+    return status(db)
+
+
+@app.post("/api/model/v5/refit")
+async def post_model_v5_refit():
+    """Run the walk-forward refit now (normally daily at 00:20 UTC)."""
+    from backend.core.model_v5 import refit_v5
+    return await refit_v5()
 
 
 @app.get("/api/survival")
