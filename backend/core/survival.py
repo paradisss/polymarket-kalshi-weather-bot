@@ -46,6 +46,7 @@ STRATEGIES: Dict[str, str] = {
     "late_gap": "Last 20% of the window: buy the side the BRTI model prices >= 10 pts above its ask (ask <= 70c)",
     "late_gap_big": "Last 20% of the window: buy the side the BRTI model prices >= 20 pts above its ask (ask <= 70c)",
     "model_gap_v5": "Same as model_gap but with model v5 (vol backbone + lead-lag, time, book imbalance; walk-forward calibrated)",
+    "fee_edge": "After 60% of the window, buy the side whose vol-backbone P beats its ask by more than the taker fee + 2c",
 }
 
 # Exit rules for strategies that sell before settlement: (take-profit bid, stop-loss bid or None)
@@ -128,6 +129,66 @@ class Quote:
         return 1 - b, 1 - a, 1 - m, (None if mod is None else 1 - mod)
 
 
+def _ncdf(x: float) -> float:
+    return 0.5 * (1 + math.erf(x / math.sqrt(2)))
+
+
+def signal_models(q: "Quote") -> dict:
+    """P(Up) from each model for one quote: base = vol backbone with the 60 s settlement average (Phi of v5's z),
+    v4 = the original BRTI model, v5 = the walk-forward calibrated model."""
+    base = None
+    if q.v5_x and len(q.v5_x) > 1:
+        base = max(0.01, min(0.99, _ncdf(q.v5_x[1])))
+    return {"base": base if base is not None else q.model_up, "v4": q.model_up, "v5": q.model_v5}
+
+
+def trade_signal(q: "Quote", model: Optional[str] = None, up_ask: Optional[float] = None,
+                 down_ask: Optional[float] = None, check_timeframe: bool = True) -> dict:
+    """Fee-aware entry signal (README format: side, ask, fee, edge, trade).
+    edge = P(side) - ask - fee, fee = feeCoefficient * ask * (1 - ask) per share (Polymarket US taker fee).
+    trade = edge > SIGNAL_MARGIN, at least SIGNAL_MIN_ELAPSED of the window gone, > 10 s left, clean book,
+    and (if check_timeframe) the window length is in SIGNAL_TIMEFRAMES."""
+    model = model or str(getattr(settings, "SIGNAL_MODEL", "base"))
+    margin = float(getattr(settings, "SIGNAL_MARGIN", 0.02))
+    min_el = float(getattr(settings, "SIGNAL_MIN_ELAPSED", 0.6))
+    tfs = {t.strip() for t in str(getattr(settings, "SIGNAL_TIMEFRAMES", "1h")).split(",") if t.strip()}
+    p_up = signal_models(q).get(model)
+    ua = up_ask if up_ask is not None else q.up_ask
+    da = down_ask if down_ask is not None else (1 - q.up_bid if q.up_bid is not None else None)
+    out = {"model": model, "side": None, "ask": None, "fee": None, "edge": None, "trade": False, "reason": None,
+           "rule": f"edge > fee + {margin:.2f}, after {min_el:.0%} of the window, timeframes {sorted(tfs)}"}
+    if p_up is None or ua is None or da is None:
+        out["reason"] = "no model or no quote"
+        return out
+    best = None
+    for side, prob, ask in (("up", p_up, ua), ("down", 1 - p_up, da)):
+        fee = q.fee_coef * ask * (1 - ask)
+        edge = prob - ask - fee
+        if best is None or edge > best[3]:
+            best = (side, prob, ask, edge, fee)
+    side, prob, ask, edge, fee = best
+    out.update(side=side, ask=round(ask, 4), fee=round(fee, 4), edge=round(edge, 4), prob=round(prob, 4))
+    minutes_left = (q.window_end - datetime.utcnow()).total_seconds() / 60
+    why = []
+    if not q.is_active:
+        why.append("window not started")
+    if q.elapsed_frac < min_el:
+        why.append(f"too early (< {min_el:.0%} elapsed)")
+    if minutes_left <= 10 / 60:
+        why.append("under 10 s to settlement")
+    if check_timeframe and q.timeframe not in tfs:
+        why.append(f"{q.timeframe} not in SIGNAL_TIMEFRAMES (lost money in the backtest)")
+    if up_ask is None and not q.clean:
+        why.append("book too wide")
+    if not 0.02 <= ask <= 0.98:
+        why.append("ask at an extreme")
+    if edge <= margin:
+        why.append(f"edge {edge:+.3f} <= {margin:.2f}")
+    out["trade"] = not why
+    out["reason"] = "; ".join(why) or "ok"
+    return out
+
+
 def model_up_prob(brti: float, beat: float, minutes_left: float, vol_pct_min: float) -> float:
     """P(Up) = Phi( ln(S/open) / sqrt(sigma^2 * t_left + basis^2) ), all in percent."""
     dist = math.log(brti / beat) * 100
@@ -200,6 +261,10 @@ def choose(strategy: str, q: Quote) -> Optional[str]:
                 mod = q.model_v5 if s == "up" else 1 - q.model_v5
                 if mod - ask >= float(getattr(settings, "V5_GAP", 0.08)) and ask <= 0.95:
                     return s
+    elif strategy == "fee_edge":
+        sig = trade_signal(q, check_timeframe=False)  # window lengths come from SURVIVAL_TIMEFRAMES
+        if sig["trade"] and sig["ask"] is not None and sig["ask"] <= 0.95:
+            return sig["side"]
     elif strategy in ("late_gap", "late_gap_big"):
         need = 0.10 if strategy == "late_gap" else 0.20
         if el >= 0.8 and q.model_up is not None:
@@ -304,6 +369,10 @@ def record_survival_trades(quotes: List[Quote]) -> dict:
                 ask, _, mid, mod = q.side(side)
                 if strat == "model_gap_v5" and q.model_v5 is not None:
                     mod = q.model_v5 if side == "up" else 1 - q.model_v5
+                if strat == "fee_edge":
+                    pb = signal_models(q).get(str(getattr(settings, "SIGNAL_MODEL", "base")))
+                    if pb is not None:
+                        mod = pb if side == "up" else 1 - pb
                 stake = round(max(1.0, st["bankroll"] * STAKE_FRAC), 2)
                 shares = stake / (ask + q.fee_coef * ask * (1 - ask))
                 t = SurvivalTrade(
