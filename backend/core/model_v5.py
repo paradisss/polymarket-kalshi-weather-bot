@@ -39,11 +39,18 @@ GATEWAY = "https://gateway.polymarket.us"
 BINANCE = "https://data-api.binance.vision/api/v3"
 UA = {"User-Agent": "Mozilla/5.0 (polymarket-btc-bot)"}
 
-# Walk-forward fit on Polymarket US, filled in from claude/model-backtest-v5.md. "1d" uses the backbone.
+# Fitted on Polymarket US windows 2026-09-22 .. 2026-11-02 (claude/model-backtest-v5.md). Walk-forward ablation:
+# 15m gains from every correction (lead-lag most); 1h gains only from lead-lag, so its other corrections stay 0;
+# 1d is the backbone (too few windows to fit). imbalance starts at 0 and is learned from the bot's own rows.
 DEFAULT_WEIGHTS: Dict[str, List[float]] = {
-    "15m": [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-    "1h": [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    "15m": [-0.0174, 0.4889, -0.3895, -0.0307, 0.1342, 0.174, 0.3703, -0.3505, 0.0133, 0.0],
+    "1h": [0.0123, 1.0345, 0.0, 0.0, 0.1641, 0.1685, 0.4122, 0.0, 0.0, 0.0],
     "1d": [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+}
+# Features the daily refit may change per timeframe (the rest stay at their current value, normally 0).
+REFIT_FEATS: Dict[str, List[str]] = {
+    "15m": FEATS,
+    "1h": ["const", "z", "lead10", "lead30", "lead60", "imbalance"],
 }
 
 _weights_cache: Tuple[float, Dict[str, List[float]], Dict[str, dict]] = (0.0, {}, {})
@@ -220,13 +227,15 @@ async def record_rows(quotes) -> int:
 
 
 # ------------------------------------------------------------------ daily walk-forward refit
-def _fit(X, y, w0, ridge):
+def _fit(X, y, w0, ridge, offset=None):
+    """Ridge-penalized probit fit (penalty toward w0); `offset` is added to X @ w."""
     import numpy as np
     from scipy.optimize import minimize
     from scipy.special import ndtr, log_ndtr
+    off = np.zeros(len(X)) if offset is None else offset
 
     def f(w):
-        m = X @ w
+        m = X @ w + off
         ll = np.where(y, log_ndtr(m), log_ndtr(-m))
         pdf = np.exp(-0.5 * m * m) / math.sqrt(2 * math.pi)
         g = np.where(y, pdf / np.maximum(ndtr(m), 1e-300), -pdf / np.maximum(ndtr(-m), 1e-300))
@@ -253,12 +262,12 @@ async def fill_outcomes(limit_slugs: int = 400) -> int:
         ).distinct().limit(limit_slugs).all()]
         for slug in slugs:
             try:
-                up_won, _ = await fetch_us_resolution(slug)
+                resolved, up = await fetch_us_resolution(slug)  # (resolved?, 1.0 Up won / 0.0 Down won)
             except Exception:
                 continue
-            if up_won is None:
+            if not resolved or up is None:
                 continue
-            filled += db.query(ModelFeatureRow).filter(ModelFeatureRow.slug == slug).update({"outcome": bool(up_won)})
+            filled += db.query(ModelFeatureRow).filter(ModelFeatureRow.slug == slug).update({"outcome": up >= 0.5})
         db.commit()
     except Exception as e:
         logger.warning(f"v5: outcome fill failed: {e}")
@@ -294,10 +303,20 @@ async def refit_v5() -> dict:
             X = lambda rs: np.array([r.x for r in rs], dtype=float)
             Y = lambda rs: np.array([bool(r.outcome) for r in rs])
             w0 = np.array(cur[tf], dtype=float)
-            w_new = _fit(X(tr), Y(tr), w0, ridge) if len(tr) >= min_rows // 2 else w0
+            free = np.array([FEATS.index(f) for f in REFIT_FEATS.get(tf, FEATS)])
+
+            def fit_masked(Xm, y):
+                # fit only the free features; the fixed ones keep w0 (their contribution is a constant offset)
+                fixed = np.setdiff1d(np.arange(len(FEATS)), free)
+                off = Xm[:, fixed] @ w0[fixed] if len(fixed) else np.zeros(len(Xm))
+                w = w0.copy()
+                w[free] = _fit(Xm[:, free], y, w0[free], ridge, offset=off)
+                return w
+
+            w_new = fit_masked(X(tr), Y(tr)) if len(tr) >= min_rows // 2 else w0
             ll_cur, ll_new = (_logloss(X(ho), Y(ho), w0), _logloss(X(ho), Y(ho), w_new)) if ho else (None, None)
-            accept = ho and ll_new <= ll_cur
-            w_all = _fit(X(rows), Y(rows), w0, ridge) if accept else w0
+            accept = bool(ho) and ll_new <= ll_cur
+            w_all = fit_masked(X(rows), Y(rows)) if accept else w0
             metrics = {"holdout_rows": len(ho), "holdout_logloss_current": ll_cur, "holdout_logloss_refit": ll_new,
                        "train_rows": len(tr)}
             db.add(ModelCoef(timeframe=tf, weights=[float(v) for v in w_all], n_rows=len(rows),

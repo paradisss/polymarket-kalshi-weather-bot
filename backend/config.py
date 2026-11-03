@@ -76,6 +76,7 @@ class Settings(BaseSettings):
     V5_HOLDOUT_DAYS: int = 2         # new weights must beat the current ones on these most recent days
     V5_MIN_REFIT_ROWS: int = 3000    # per timeframe; until then the backtested default weights are used
     V5_RIDGE: float = 5.0            # pull toward the current weights
+    V5_GAP: float = 0.08             # model_gap_v5 buys when v5 beats the ask by this much (model_gap uses 0.08)
 
     # Real money on Polymarket US - OFF unless every one of these is set. Orders are only placed
     # for strategies listed in US_LIVE_STRATEGIES that the survival scoreboard marks PROVEN

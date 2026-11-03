@@ -673,14 +673,21 @@ async def get_intl_5m():
     return data
 
 
+_us_markets_cache: dict = {"t": 0.0, "data": None}
+
+
 @app.get("/api/us/markets")
 async def get_us_markets():
     """Polymarket US BTC Up/Down windows priced exactly like the app: BRTI index, price to beat,
-    live book, and the BRTI price model's P(Up)."""
+    live book, the BRTI price model's P(Up) (model_up = v4) and model v5 (model_v5_up).
+    Cached for 3 s so dashboards polling every few seconds don't multiply the upstream calls."""
+    import time as _time
+    if _us_markets_cache["data"] is not None and _time.time() - _us_markets_cache["t"] < 3:
+        return _us_markets_cache["data"]
     from backend.core.survival import fetch_us_quotes
     quotes = await fetch_us_quotes()
     brti = next((q.brti for q in quotes if q.brti), None)
-    return {
+    data = {
         "venue": "polymarket_us",
         "index": "CF Benchmarks BRTI",
         "btc": brti,
@@ -697,6 +704,8 @@ async def get_us_markets():
         } for q in sorted(quotes, key=lambda x: ["15m", "1h", "1d"].index(x.timeframe))],
         "generated_at": datetime.utcnow().isoformat() + "Z",
     }
+    _us_markets_cache.update(t=_time.time(), data=data)
+    return data
 
 
 @app.get("/api/us/account")

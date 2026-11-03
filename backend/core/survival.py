@@ -47,7 +47,6 @@ STRATEGIES: Dict[str, str] = {
     "late_gap_big": "Last 20% of the window: buy the side the BRTI model prices >= 20 pts above its ask (ask <= 70c)",
     "model_gap_v5": "Same as model_gap but with model v5 (vol backbone + lead-lag, time, book imbalance; walk-forward calibrated)",
 }
-V5_GAP = 0.08  # model_gap_v5 entry threshold, same as model_gap
 
 # Exit rules for strategies that sell before settlement: (take-profit bid, stop-loss bid or None)
 EXITS = {"dip_tp80": (0.80, None), "dip_tp80_sl": (0.80, 0.10)}
@@ -199,7 +198,7 @@ def choose(strategy: str, q: Quote) -> Optional[str]:
             for s in ("up", "down"):
                 ask = q.side(s)[0]
                 mod = q.model_v5 if s == "up" else 1 - q.model_v5
-                if mod - ask >= V5_GAP and ask <= 0.95:
+                if mod - ask >= float(getattr(settings, "V5_GAP", 0.08)) and ask <= 0.95:
                     return s
     elif strategy in ("late_gap", "late_gap_big"):
         need = 0.10 if strategy == "late_gap" else 0.20
