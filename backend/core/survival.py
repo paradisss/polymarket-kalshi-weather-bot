@@ -45,6 +45,7 @@ STRATEGIES: Dict[str, str] = {
     "dip_tp80_sl": "Same as dip_tp80 but also cut the loss if the bid falls to 10c",
     "late_gap": "Last 20% of the window: buy the side the BRTI model prices >= 10 pts above its ask (ask <= 70c)",
     "late_gap_big": "Last 20% of the window: buy the side the BRTI model prices >= 20 pts above its ask (ask <= 70c)",
+    "model_gap_v5": "Same as model_gap but with model v5 (vol backbone + lead-lag, time, book imbalance; walk-forward calibrated)",
 }
 
 # Exit rules for strategies that sell before settlement: (take-profit bid, stop-loss bid or None)
@@ -105,6 +106,10 @@ class Quote:
     price_to_beat: Optional[float] = None
     brti: Optional[float] = None
     model_up: Optional[float] = None
+    model_v5: Optional[float] = None              # v5 P(Up) (backend/core/model_v5.py)
+    v5_x: Optional[list] = None                   # v5 feature vector
+    v5_imbalance: Optional[float] = None
+    v5_depth: tuple = (0.0, 0.0)
 
     @property
     def clean(self) -> bool:
@@ -131,10 +136,19 @@ def model_up_prob(brti: float, beat: float, minutes_left: float, vol_pct_min: fl
 
 
 async def fetch_us_quotes() -> List[Quote]:
+    import asyncio
     from backend.data.polymarket_us import fetch_us_btc_markets, fetch_brti, fetch_brti_minute_vol
     markets = await fetch_us_btc_markets()
-    brti, _ = await fetch_brti(30)
-    vol = await fetch_brti_minute_vol(60) or 0.03
+    vol_raw = await fetch_brti_minute_vol(60)
+    vol = vol_raw or 0.03
+    inp = None
+    if getattr(settings, "V5_ENABLED", True):
+        try:
+            from backend.core.model_v5 import gather_inputs
+            inp = await gather_inputs(vol_raw)
+        except Exception as e:
+            logger.debug(f"v5 inputs failed: {e}")
+    brti = inp.S if (inp and inp.S) else (await fetch_brti(30))[0]
     out = []
     for m in markets:
         q = Quote(market_id=m.slug, slug=m.slug, timeframe=m.timeframe,
@@ -144,6 +158,17 @@ async def fetch_us_quotes() -> List[Quote]:
         if m.is_active and brti and m.price_to_beat:
             q.model_up = model_up_prob(brti, m.price_to_beat, m.minutes_left, vol)
         out.append(q)
+    if inp is not None:
+        try:
+            from backend.core.model_v5 import features, predict, fetch_book_imbalance
+            active = [(q, m) for q, m in zip(out, markets) if m.is_active and m.price_to_beat]
+            books = await asyncio.gather(*[fetch_book_imbalance(q.slug) for q, _ in active])
+            for (q, m), (imb, bq, aq) in zip(active, books):
+                q.v5_imbalance, q.v5_depth = imb, (bq, aq)
+                q.v5_x = features(inp, m.price_to_beat, m.minutes_left, m.elapsed_frac, imb)
+                q.model_v5 = predict(q.timeframe, q.v5_x)
+        except Exception as e:
+            logger.warning(f"v5 prediction failed: {e}")
     return out
 
 
@@ -167,6 +192,13 @@ def choose(strategy: str, q: Quote) -> Optional[str]:
             for s in ("up", "down"):
                 ask, _, _, mod = q.side(s)
                 if mod - ask >= 0.08 and ask <= 0.95:
+                    return s
+    elif strategy == "model_gap_v5":
+        if el >= 0.6 and q.model_v5 is not None:
+            for s in ("up", "down"):
+                ask = q.side(s)[0]
+                mod = q.model_v5 if s == "up" else 1 - q.model_v5
+                if mod - ask >= float(getattr(settings, "V5_GAP", 0.08)) and ask <= 0.95:
                     return s
     elif strategy in ("late_gap", "late_gap_big"):
         need = 0.10 if strategy == "late_gap" else 0.20
@@ -270,6 +302,8 @@ def record_survival_trades(quotes: List[Quote]) -> dict:
                                                     SurvivalTrade.market_id == q.market_id).first():
                     continue
                 ask, _, mid, mod = q.side(side)
+                if strat == "model_gap_v5" and q.model_v5 is not None:
+                    mod = q.model_v5 if side == "up" else 1 - q.model_v5
                 stake = round(max(1.0, st["bankroll"] * STAKE_FRAC), 2)
                 shares = stake / (ask + q.fee_coef * ask * (1 - ask))
                 t = SurvivalTrade(
@@ -301,6 +335,12 @@ async def run_survival_cycle() -> dict:
     quotes = await fetch_us_quotes()
     summary = record_survival_trades(quotes)
     summary["windows"] = len(quotes)
+    if getattr(settings, "V5_ENABLED", True):
+        try:
+            from backend.core.model_v5 import record_rows
+            summary["v5_rows"] = await record_rows(quotes)
+        except Exception as e:
+            logger.warning(f"v5 recording failed: {e}")
     try:
         from backend.core.us_live import mirror_live
         summary["live"] = await mirror_live(summary, quotes)

@@ -673,14 +673,21 @@ async def get_intl_5m():
     return data
 
 
+_us_markets_cache: dict = {"t": 0.0, "data": None}
+
+
 @app.get("/api/us/markets")
 async def get_us_markets():
     """Polymarket US BTC Up/Down windows priced exactly like the app: BRTI index, price to beat,
-    live book, and the BRTI price model's P(Up)."""
+    live book, the BRTI price model's P(Up) (model_up = v4) and model v5 (model_v5_up).
+    Cached for 3 s so dashboards polling every few seconds don't multiply the upstream calls."""
+    import time as _time
+    if _us_markets_cache["data"] is not None and _time.time() - _us_markets_cache["t"] < 3:
+        return _us_markets_cache["data"]
     from backend.core.survival import fetch_us_quotes
     quotes = await fetch_us_quotes()
     brti = next((q.brti for q in quotes if q.brti), None)
-    return {
+    data = {
         "venue": "polymarket_us",
         "index": "CF Benchmarks BRTI",
         "btc": brti,
@@ -691,11 +698,14 @@ async def get_us_markets():
             "price_to_beat": q.price_to_beat,
             "distance": (q.brti - q.price_to_beat) if (q.brti and q.price_to_beat) else None,
             "up_bid": q.up_bid, "up_ask": q.up_ask, "market_up": q.mid,
-            "model_up": q.model_up, "fee_coef": q.fee_coef,
+            "model_up": q.model_up, "model_v5_up": q.model_v5, "book_imbalance": q.v5_imbalance,
+            "fee_coef": q.fee_coef,
             "url": f"https://polymarket.us/event/{q.slug.removeprefix('cpc-')}",
         } for q in sorted(quotes, key=lambda x: ["15m", "1h", "1d"].index(x.timeframe))],
         "generated_at": datetime.utcnow().isoformat() + "Z",
     }
+    _us_markets_cache.update(t=_time.time(), data=data)
+    return data
 
 
 @app.get("/api/us/account")
@@ -705,6 +715,20 @@ async def get_us_account():
     res = await check_key()
     res["live_blockers"] = live_blockers()
     return res
+
+
+@app.get("/api/model/v5")
+async def get_model_v5(db: Session = Depends(get_db)):
+    """Model v5: current weights (backtested default or latest accepted refit), recorded rows, refit history."""
+    from backend.core.model_v5 import status
+    return status(db)
+
+
+@app.post("/api/model/v5/refit")
+async def post_model_v5_refit():
+    """Run the walk-forward refit now (normally daily at 00:20 UTC)."""
+    from backend.core.model_v5 import refit_v5
+    return await refit_v5()
 
 
 @app.get("/api/survival")

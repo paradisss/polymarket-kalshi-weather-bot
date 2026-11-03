@@ -136,6 +136,44 @@ class SurvivalTrade(Base):
     index_at_entry = Column(Float, nullable=True)  # settlement index (BRTI) when the trade opened
 
 
+class ModelFeatureRow(Base):
+    """Model v5: one row per active Polymarket US window per minute - features (incl. book imbalance),
+    market, both models, and the outcome once settled. The daily walk-forward refit learns from these."""
+    __tablename__ = "model_v5_rows"
+
+    id = Column(Integer, primary_key=True, index=True)
+    slug = Column(String, index=True)
+    timeframe = Column(String, index=True)
+    minute_ts = Column(Integer, index=True)       # unix minute the row was recorded
+    window_end = Column(DateTime, index=True)
+    frac = Column(Float)                          # share of the window elapsed
+    x = Column(JSON)                              # feature vector, model_v5.FEATS order
+    imbalance = Column(Float, nullable=True)      # Up book (bid qty - ask qty) / total near the touch
+    bid_qty = Column(Float, nullable=True)
+    ask_qty = Column(Float, nullable=True)
+    market_mid = Column(Float, nullable=True)
+    up_bid = Column(Float, nullable=True)
+    up_ask = Column(Float, nullable=True)
+    v4 = Column(Float, nullable=True)
+    v5 = Column(Float, nullable=True)
+    outcome = Column(Boolean, nullable=True, index=True)  # True = Up won
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class ModelCoef(Base):
+    """Model v5 weights from each daily walk-forward refit (accepted only if they beat the current
+    weights on the most recent holdout days)."""
+    __tablename__ = "model_v5_coefs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    timeframe = Column(String, index=True)
+    weights = Column(JSON)
+    n_rows = Column(Integer)
+    accepted = Column(Boolean, default=False, index=True)
+    metrics = Column(JSON, nullable=True)
+    fitted_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+
 class LiveTrade(Base):
     """Real-money orders on Polymarket US, mirrored from PROVEN survival strategies only."""
     __tablename__ = "live_trades"

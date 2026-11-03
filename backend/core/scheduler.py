@@ -413,6 +413,29 @@ async def survival_job():
         logger.exception("Error in survival_job")
 
 
+async def v5_outcomes_job():
+    """Model v5: mark recorded rows with their outcome once the window resolves."""
+    try:
+        from backend.core.model_v5 import fill_outcomes
+        n = await fill_outcomes()
+        if n:
+            log_event("data", f"Model v5: outcomes set on {n} recorded rows")
+    except Exception as e:
+        logger.warning(f"v5 outcomes job failed: {e}")
+
+
+async def v5_refit_job():
+    """Model v5: daily walk-forward recalibration from the bot's own recorded rows."""
+    try:
+        from backend.core.model_v5 import refit_v5
+        rep = await refit_v5()
+        log_event("info", f"Model v5 refit: " + ", ".join(
+            f"{tf} {r.get('status')} ({r.get('rows')} rows)" for tf, r in rep.items() if isinstance(r, dict)), rep)
+    except Exception as e:
+        log_event("error", f"Model v5 refit failed: {e}")
+        logger.exception("Error in v5_refit_job")
+
+
 async def heartbeat_job():
     """Periodic heartbeat. Runs every minute."""
     db = None
@@ -476,6 +499,13 @@ def start_scheduler():
             replace_existing=True,
             max_instances=1,
         )
+
+    if getattr(settings, "V5_ENABLED", True):
+        from apscheduler.triggers.cron import CronTrigger
+        scheduler.add_job(v5_outcomes_job, IntervalTrigger(minutes=15), id="v5_outcomes",
+                          replace_existing=True, max_instances=1)
+        scheduler.add_job(v5_refit_job, CronTrigger(hour=0, minute=20, timezone="UTC"), id="v5_refit",
+                          replace_existing=True, max_instances=1)
 
     # Heartbeat every minute
     scheduler.add_job(
