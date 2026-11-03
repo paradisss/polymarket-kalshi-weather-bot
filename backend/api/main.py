@@ -674,6 +674,49 @@ async def get_intl_5m():
 
 
 _us_markets_cache: dict = {"t": 0.0, "data": None}
+_quotes_cache: dict = {"t": 0.0, "quotes": None}
+
+
+async def _cached_quotes():
+    """Live Polymarket US quotes (with both models), shared by /api/us/markets and /api/predict for 3 s."""
+    import time as _time
+    if _quotes_cache["quotes"] is not None and _time.time() - _quotes_cache["t"] < 3:
+        return _quotes_cache["quotes"]
+    from backend.core.survival import fetch_us_quotes
+    quotes = await fetch_us_quotes()
+    _quotes_cache.update(t=_time.time(), quotes=quotes)
+    return quotes
+
+
+@app.get("/api/predict")
+async def get_predict(tf: str = "1h", ask: Optional[float] = None, down_ask: Optional[float] = None,
+                      model: Optional[str] = None):
+    """Prediction + fee-aware trade signal for the open Polymarket US window of length tf (15m, 1h, 1d), in the
+    format of the user's btc_short_market_predictor README.
+    ask / down_ask: optional Up (Yes) and Down ask prices to evaluate instead of the live book.
+    model: base (vol backbone, default), v5 or v4. trade=true only where the rule backtested positive (SIGNAL_*)."""
+    from backend.core.survival import trade_signal, signal_models
+    tf = {"15": "15m", "60": "1h", "1440": "1d", "hourly": "1h", "daily": "1d"}.get(tf, tf)
+    quotes = await _cached_quotes()
+    q = next((x for x in quotes if x.timeframe == tf and x.is_active), None)
+    if q is None:
+        return {"tf": tf, "error": f"no open {tf} window on Polymarket US right now"}
+    models = signal_models(q)
+    sig = trade_signal(q, model=model, up_ask=ask, down_ask=down_ask)
+    p_up = models.get(sig["model"])
+    return {
+        "tf": tf, "slug": q.slug, "venue": "polymarket_us", "index": "CF Benchmarks BRTI",
+        "window_end": q.window_end.isoformat() + "Z", "elapsed_frac": round(q.elapsed_frac, 3),
+        "minutes_left": round(max(0.0, (q.window_end - datetime.utcnow()).total_seconds() / 60), 2),
+        "price_to_beat": q.price_to_beat, "now": q.brti,
+        "probability": {"model": sig["model"], "up": None if p_up is None else round(p_up, 4),
+                        "down": None if p_up is None else round(1 - p_up, 4)},
+        "models": {k: (None if v is None else round(v, 4)) for k, v in models.items()},
+        "market": {"up_bid": q.up_bid, "up_ask": q.up_ask, "mid": q.mid, "book_imbalance": q.v5_imbalance},
+        "signal": sig,
+        "url": f"https://polymarket.us/event/{q.slug.removeprefix('cpc-')}",
+        "generated_at": datetime.utcnow().isoformat() + "Z",
+    }
 
 
 @app.get("/api/us/markets")
@@ -684,8 +727,8 @@ async def get_us_markets():
     import time as _time
     if _us_markets_cache["data"] is not None and _time.time() - _us_markets_cache["t"] < 3:
         return _us_markets_cache["data"]
-    from backend.core.survival import fetch_us_quotes
-    quotes = await fetch_us_quotes()
+    from backend.core.survival import trade_signal
+    quotes = await _cached_quotes()
     brti = next((q.brti for q in quotes if q.brti), None)
     data = {
         "venue": "polymarket_us",
@@ -699,6 +742,7 @@ async def get_us_markets():
             "distance": (q.brti - q.price_to_beat) if (q.brti and q.price_to_beat) else None,
             "up_bid": q.up_bid, "up_ask": q.up_ask, "market_up": q.mid,
             "model_up": q.model_up, "model_v5_up": q.model_v5, "book_imbalance": q.v5_imbalance,
+            "signal": trade_signal(q) if q.is_active else None,
             "fee_coef": q.fee_coef,
             "url": f"https://polymarket.us/event/{q.slug.removeprefix('cpc-')}",
         } for q in sorted(quotes, key=lambda x: ["15m", "1h", "1d"].index(x.timeframe))],

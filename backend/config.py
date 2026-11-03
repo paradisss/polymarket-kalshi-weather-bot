@@ -78,6 +78,14 @@ class Settings(BaseSettings):
     V5_RIDGE: float = 5.0            # pull toward the current weights
     V5_GAP: float = 0.08             # model_gap_v5 buys when v5 beats the ask by this much (model_gap uses 0.08)
 
+    # Fee-aware trade signal (/api/predict and the fee_edge paper strategy), adapted from the user's
+    # btc_short_market_predictor README. Its own rule (last 3.5 min, edge > fee + 2c) lost money in the
+    # Polymarket US backtest; this is the variant that tested positive: after 60% of the window, hourly only.
+    SIGNAL_MODEL: str = "base"         # base = vol backbone (README's analytic baseline), v5, or v4
+    SIGNAL_MARGIN: float = 0.02        # edge must exceed the taker fee by this much
+    SIGNAL_MIN_ELAPSED: float = 0.6    # share of the window that must have passed
+    SIGNAL_TIMEFRAMES: str = "1h"      # window lengths where /api/predict may say trade=true
+
     # Real money on Polymarket US - OFF unless every one of these is set. Orders are only placed
     # for strategies listed in US_LIVE_STRATEGIES that the survival scoreboard marks PROVEN
     # (or TESTING, for strategies the owner lists in US_LIVE_ALLOW_UNPROVEN).
